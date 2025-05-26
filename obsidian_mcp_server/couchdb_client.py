@@ -71,7 +71,7 @@ class CouchDBClient:
             # Use CouchDB _find endpoint for efficient querying
             url = self._get_db_url("_find")
             
-            # Build query to find notes and newnotes that aren't deleted
+            # Build query to find notes and newnotes that aren't deleted and are markdown files
             query = {
                 "selector": {
                     "$and": [
@@ -85,6 +85,11 @@ class CouchDBClient:
                                 {"deleted": {"$exists": False}},
                                 {"deleted": False}
                             ]
+                        },
+                        {
+                            "path": {
+                                "$regex": r"\.md$"
+                            }
                         }
                     ]
                 },
@@ -142,9 +147,12 @@ class CouchDBClient:
                 if not doc:
                     continue
                 
-                # Filter for note documents that aren't deleted
+                # Filter for note documents that aren't deleted and are markdown files
                 doc_type = doc.get("type")
-                if doc_type in ["notes", "newnote"] and not doc.get("deleted", False):
+                doc_path = doc.get("path", "")
+                if (doc_type in ["notes", "newnote"] and 
+                    not doc.get("deleted", False) and 
+                    doc_path.endswith(".md")):
                     try:
                         if doc_type == "notes":
                             note = NoteEntry(**doc)
@@ -357,6 +365,11 @@ class CouchDBClient:
                                 {"deleted": {"$exists": False}},
                                 {"deleted": False}
                             ]
+                        },
+                        {
+                            "path": {
+                                "$regex": r"\.md$"
+                            }
                         },
                         {
                             "$or": [
