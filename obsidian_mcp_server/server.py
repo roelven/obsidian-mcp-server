@@ -101,6 +101,7 @@ class ObsidianMCPServer:
         @self.app.list_tools()
         async def list_tools() -> List[types.Tool]:
             """List available tools."""
+            logger.info("Tools requested - returning search_notes and browse_notes")
             return [
                 types.Tool(
                     name="search_notes",
@@ -161,6 +162,7 @@ class ObsidianMCPServer:
                 )]
             
             if name == "search_notes":
+                logger.info(f"search_notes tool called with arguments: {arguments}")
                 try:
                     query = arguments.get("query", "").strip()
                     limit = min(arguments.get("limit", 10), 50)  # Cap at 50
@@ -229,6 +231,7 @@ class ObsidianMCPServer:
                         text=f"Error searching notes: {e}"
                     )]
             elif name == "browse_notes":
+                logger.info(f"browse_notes tool called with arguments: {arguments}")
                 try:
                     limit = min(arguments.get("limit", 20), 50)  # Cap at 50
                     sort_by = arguments.get("sort_by", "mtime")
