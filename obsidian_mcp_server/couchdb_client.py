@@ -71,13 +71,14 @@ class CouchDBClient:
             # Use CouchDB _find endpoint for efficient querying
             url = self._get_db_url("_find")
             
-            # Build query to find notes and newnotes that aren't deleted and are markdown files
+            # Build query to find notes and newnotes that aren't deleted
+            # Include "plain" type for encrypted vaults
             query = {
                 "selector": {
                     "$and": [
                         {
                             "type": {
-                                "$in": ["notes", "newnote"]
+                                "$in": ["notes", "newnote", "plain"]
                             }
                         },
                         {
@@ -85,15 +86,10 @@ class CouchDBClient:
                                 {"deleted": {"$exists": False}},
                                 {"deleted": False}
                             ]
-                        },
-                        {
-                            "path": {
-                                "$regex": r"\.md$"
-                            }
                         }
                     ]
                 },
-                "limit": limit,
+                "limit": limit * 3,  # Get more docs since we'll filter for .md files
                 "skip": skip,
                 "sort": [
                     {sort_by: "desc"}  # Sort by modification time (newest first)
@@ -103,19 +99,38 @@ class CouchDBClient:
             response = await self.client.post(url, json=query)
             if response.status_code != 200:
                 # Fallback to _all_docs if _find is not available
+                print(f"DEBUG: _find failed with status {response.status_code}, falling back to _all_docs")
                 return await self._list_notes_fallback(limit, skip)
             
             data = response.json()
             notes = []
+            total_docs = len(data.get("docs", []))
+            print(f"DEBUG: _find returned {total_docs} documents")
             
             for doc in data.get("docs", []):
                 doc_type = doc.get("type")
+                doc_path = doc.get("path", "")
+                
+                # Filter for markdown files only
+                if not doc_path.endswith(".md"):
+                    continue
+                    
                 try:
                     if doc_type == "notes":
                         note = NoteEntry(**doc)
-                    else:  # newnote
+                    elif doc_type == "newnote":
                         note = NewEntry(**doc)
+                    elif doc_type == "plain":
+                        # Handle encrypted documents - treat as NewEntry for now
+                        # since they have children field for chunks
+                        note = NewEntry(**doc)
+                    else:
+                        continue
                     notes.append(note)
+                    
+                    # Stop when we have enough notes
+                    if len(notes) >= limit:
+                        break
                 except Exception:
                     # Skip malformed documents
                     continue
@@ -137,10 +152,13 @@ class CouchDBClient:
             
             response = await self.client.get(url, params=params)
             if response.status_code != 200:
+                print(f"DEBUG: _all_docs failed with status {response.status_code}")
                 return []
             
             data = response.json()
             notes = []
+            total_rows = len(data.get("rows", []))
+            print(f"DEBUG: _all_docs returned {total_rows} rows")
             
             for row in data.get("rows", []):
                 doc = row.get("doc", {})
@@ -150,14 +168,18 @@ class CouchDBClient:
                 # Filter for note documents that aren't deleted and are markdown files
                 doc_type = doc.get("type")
                 doc_path = doc.get("path", "")
-                if (doc_type in ["notes", "newnote"] and 
+                if (doc_type in ["notes", "newnote", "plain"] and 
                     not doc.get("deleted", False) and 
                     doc_path.endswith(".md")):
                     try:
                         if doc_type == "notes":
                             note = NoteEntry(**doc)
-                        else:  # newnote
+                        elif doc_type == "newnote":
                             note = NewEntry(**doc)
+                        elif doc_type == "plain":
+                            note = NewEntry(**doc)
+                        else:
+                            continue
                         notes.append(note)
                         
                         # Stop when we have enough notes
@@ -219,11 +241,20 @@ class CouchDBClient:
             if chunk_data and chunk_data.get("type") == "leaf":
                 try:
                     chunk = EntryLeaf(**chunk_data)
+                    # Check if chunk is encrypted
+                    if hasattr(chunk, 'eden') and chunk.eden:
+                        # This is an encrypted chunk - we can't read the content
+                        return "[ENCRYPTED CONTENT - Cannot read encrypted vault without passphrase]"
                     chunks.append(chunk.data)
                 except Exception:
                     continue
         
-        return "".join(chunks)
+        content = "".join(chunks)
+        # If content is empty but we had chunks, it's likely encrypted
+        if not content and chunk_ids:
+            return "[ENCRYPTED CONTENT - Cannot read encrypted vault without passphrase]"
+        
+        return content
     
     def _extract_title_from_content(self, content: str, path: str) -> str:
         """Extract title from note content or use filename."""
@@ -265,6 +296,9 @@ class CouchDBClient:
             # Get content
             if isinstance(entry, NoteEntry):
                 content = entry.data
+                # Check if content is encrypted
+                if hasattr(entry, 'eden') and entry.eden:
+                    content = "[ENCRYPTED CONTENT - Cannot read encrypted vault without passphrase]"
             elif isinstance(entry, NewEntry):
                 content = await self._reassemble_chunked_content(entry.children)
             else:
@@ -351,13 +385,13 @@ class CouchDBClient:
             # Use CouchDB _find with text search
             url = self._get_db_url("_find")
             
-            # Build text search query
+            # Build text search query (simplified to avoid regex issues)
             search_query = {
                 "selector": {
                     "$and": [
                         {
                             "type": {
-                                "$in": ["notes", "newnote"]
+                                "$in": ["notes", "newnote", "plain"]
                             }
                         },
                         {
@@ -365,21 +399,10 @@ class CouchDBClient:
                                 {"deleted": {"$exists": False}},
                                 {"deleted": False}
                             ]
-                        },
-                        {
-                            "path": {
-                                "$regex": r"\.md$"
-                            }
-                        },
-                        {
-                            "$or": [
-                                {"path": {"$regex": f"(?i).*{re.escape(query)}.*"}},
-                                {"data": {"$regex": f"(?i).*{re.escape(query)}.*"}}
-                            ]
                         }
                     ]
                 },
-                "limit": limit,
+                "limit": limit * 3,  # Get more docs since we'll filter
                 "sort": [{"mtime": "desc"}]
             }
             
@@ -389,17 +412,36 @@ class CouchDBClient:
             
             data = response.json()
             notes = []
+            query_lower = query.lower()
             
             for doc in data.get("docs", []):
                 doc_type = doc.get("type")
-                try:
-                    if doc_type == "notes":
-                        note = NoteEntry(**doc)
-                    else:  # newnote
-                        note = NewEntry(**doc)
-                    notes.append(note)
-                except Exception:
+                doc_path = doc.get("path", "")
+                doc_data = doc.get("data", "")
+                
+                # Filter for markdown files only
+                if not doc_path.endswith(".md"):
                     continue
+                
+                # Simple text search in path and data
+                if (query_lower in doc_path.lower() or 
+                    query_lower in doc_data.lower()):
+                    try:
+                        if doc_type == "notes":
+                            note = NoteEntry(**doc)
+                        elif doc_type == "newnote":
+                            note = NewEntry(**doc)
+                        elif doc_type == "plain":
+                            note = NewEntry(**doc)
+                        else:
+                            continue
+                        notes.append(note)
+                        
+                        # Stop when we have enough notes
+                        if len(notes) >= limit:
+                            break
+                    except Exception:
+                        continue
             
             return notes
             
