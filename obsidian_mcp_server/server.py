@@ -46,9 +46,9 @@ class ObsidianMCPServer:
                 raise ValueError("Rate limit exceeded. Please wait before making more requests.")
             
             try:
-                # Limit to a reasonable number to prevent overwhelming AI clients
-                # AI clients should ask for specific notes rather than processing everything
-                entries = await self.couchdb_client.list_notes(limit=50, sort_by="mtime")
+                # Limit to a very small number to prevent overwhelming AI clients
+                # AI clients should use search_notes or browse_notes tools instead
+                entries = await self.couchdb_client.list_notes(limit=10, sort_by="mtime")
                 resources = []
                 
                 for entry in entries:
@@ -67,7 +67,7 @@ class ObsidianMCPServer:
                     )
                     resources.append(resource)
                 
-                logger.info(f"Listed {len(resources)} resources (limited to 50 for performance)")
+                logger.info(f"Listed {len(resources)} resources (limited to 10 for performance - use tools for more)")
                 return resources
             except Exception as e:
                 logger.error(f"Error listing resources: {e}")
@@ -104,13 +104,14 @@ class ObsidianMCPServer:
             return [
                 types.Tool(
                     name="search_notes",
-                    description="Search through Obsidian notes by title, content, or tags. Use this instead of listing all notes.",
+                    description="Search through Obsidian notes by title, content, or tags. Leave query empty to browse recent notes.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query to find relevant notes"
+                                "description": "Search query to find relevant notes. Leave empty to browse recent notes.",
+                                "default": ""
                             },
                             "limit": {
                                 "type": "integer",
@@ -120,7 +121,30 @@ class ObsidianMCPServer:
                                 "maximum": 50
                             }
                         },
-                        "required": ["query"]
+                        "required": []
+                    }
+                ),
+                types.Tool(
+                    name="browse_notes",
+                    description="Browse recent Obsidian notes without searching. Use this to discover available notes.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of notes to return (default: 20, max: 50)",
+                                "default": 20,
+                                "minimum": 1,
+                                "maximum": 50
+                            },
+                            "sort_by": {
+                                "type": "string",
+                                "description": "Sort order for notes",
+                                "enum": ["mtime", "ctime", "path"],
+                                "default": "mtime"
+                            }
+                        },
+                        "required": []
                     }
                 )
             ]
@@ -138,31 +162,98 @@ class ObsidianMCPServer:
             
             if name == "search_notes":
                 try:
-                    query = arguments.get("query", "")
+                    query = arguments.get("query", "").strip()
                     limit = min(arguments.get("limit", 10), 50)  # Cap at 50
                     
                     if not query:
+                        # If no query, browse recent notes
+                        entries = await self.couchdb_client.list_notes(limit=limit, sort_by="mtime")
+                        notes = []
+                        for entry in entries:
+                            note = await self.couchdb_client.process_note(entry)
+                            if note:
+                                notes.append(note)
+                        
+                        if not notes:
+                            return [types.TextContent(
+                                type="text",
+                                text="No notes found in your vault"
+                            )]
+                        
+                        # Format browse results
+                        response_lines = [f"Recent {len(notes)} notes from your vault:\n"]
+                        
+                        for note in notes:
+                            response_lines.append(f"**{note.title}**")
+                            response_lines.append(f"Path: {note.path}")
+                            if note.tags:
+                                response_lines.append(f"Tags: {', '.join(note.tags)}")
+                            response_lines.append(f"URI: {self._create_note_uri(note.path)}")
+                            response_lines.append("")  # Empty line
+                        
                         return [types.TextContent(
                             type="text",
-                            text="Error: Search query is required"
+                            text="\n".join(response_lines)
                         )]
-                    
-                    # Search notes
-                    results = await self.couchdb_client.search_notes(query, limit)
-                    
-                    if not results:
+                    else:
+                        # Search with query
+                        results = await self.couchdb_client.search_notes(query, limit)
+                        
+                        if not results:
+                            return [types.TextContent(
+                                type="text",
+                                text=f"No notes found matching '{query}'"
+                            )]
+                        
+                        # Format search results
+                        response_lines = [f"Found {len(results)} notes matching '{query}':\n"]
+                        
+                        for note, score in results:
+                            response_lines.append(f"**{note.title}**")
+                            response_lines.append(f"Path: {note.path}")
+                            response_lines.append(f"Score: {score:.1f}")
+                            if note.tags:
+                                response_lines.append(f"Tags: {', '.join(note.tags)}")
+                            response_lines.append(f"URI: {self._create_note_uri(note.path)}")
+                            response_lines.append("")  # Empty line
+                        
                         return [types.TextContent(
                             type="text",
-                            text=f"No notes found matching '{query}'"
+                            text="\n".join(response_lines)
                         )]
                     
-                    # Format results
-                    response_lines = [f"Found {len(results)} notes matching '{query}':\n"]
+                except Exception as e:
+                    logger.error(f"Error in search_notes tool: {e}")
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Error searching notes: {e}"
+                    )]
+            elif name == "browse_notes":
+                try:
+                    limit = min(arguments.get("limit", 20), 50)  # Cap at 50
+                    sort_by = arguments.get("sort_by", "mtime")
                     
-                    for note, score in results:
+                    # Get recent notes
+                    entries = await self.couchdb_client.list_notes(limit=limit, sort_by=sort_by)
+                    notes = []
+                    for entry in entries:
+                        note = await self.couchdb_client.process_note(entry)
+                        if note:
+                            notes.append(note)
+                    
+                    if not notes:
+                        return [types.TextContent(
+                            type="text",
+                            text="No notes found in your vault"
+                        )]
+                    
+                    # Format browse results
+                    sort_desc = {"mtime": "recently modified", "ctime": "recently created", "path": "alphabetical"}
+                    response_lines = [f"Browsing {len(notes)} {sort_desc.get(sort_by, 'recent')} notes:\n"]
+                    
+                    for note in notes:
                         response_lines.append(f"**{note.title}**")
                         response_lines.append(f"Path: {note.path}")
-                        response_lines.append(f"Score: {score:.1f}")
                         if note.tags:
                             response_lines.append(f"Tags: {', '.join(note.tags)}")
                         response_lines.append(f"URI: {self._create_note_uri(note.path)}")
@@ -174,10 +265,10 @@ class ObsidianMCPServer:
                     )]
                     
                 except Exception as e:
-                    logger.error(f"Error in search_notes tool: {e}")
+                    logger.error(f"Error in browse_notes tool: {e}")
                     return [types.TextContent(
                         type="text",
-                        text=f"Error searching notes: {e}"
+                        text=f"Error browsing notes: {e}"
                     )]
             else:
                 return [types.TextContent(
