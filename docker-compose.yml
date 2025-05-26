@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  obsidian-mcp-server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # CouchDB connection settings
+      COUCHDB_BASE_URL: ${COUCHDB_BASE_URL}
+      COUCHDB_DATABASE_NAME: ${COUCHDB_DATABASE_NAME}
+      COUCHDB_USER: ${COUCHDB_USER}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
+      
+      # Server settings
+      SERVER_PORT: 8000
+      API_KEY: ${API_KEY}
+      
+      # LiveSync settings
+      USE_PATH_OBFUSCATION: ${USE_PATH_OBFUSCATION:-false}
+      VAULT_ID: ${VAULT_ID:-default}
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/sse"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    restart: unless-stopped 
