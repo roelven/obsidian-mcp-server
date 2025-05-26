@@ -65,14 +65,68 @@ class CouchDBClient:
         except Exception:
             return None
     
-    async def list_notes(self, limit: int = 100, skip: int = 0) -> List[EntryDoc]:
-        """List all note documents from CouchDB."""
+    async def list_notes(self, limit: int = 100, skip: int = 0, sort_by: str = "mtime") -> List[EntryDoc]:
+        """List note documents from CouchDB using efficient database queries."""
         try:
-            # Query for documents with type "notes" or "newnote"
+            # Use CouchDB _find endpoint for efficient querying
+            url = self._get_db_url("_find")
+            
+            # Build query to find notes and newnotes that aren't deleted
+            query = {
+                "selector": {
+                    "$and": [
+                        {
+                            "type": {
+                                "$in": ["notes", "newnote"]
+                            }
+                        },
+                        {
+                            "$or": [
+                                {"deleted": {"$exists": False}},
+                                {"deleted": False}
+                            ]
+                        }
+                    ]
+                },
+                "limit": limit,
+                "skip": skip,
+                "sort": [
+                    {sort_by: "desc"}  # Sort by modification time (newest first)
+                ]
+            }
+            
+            response = await self.client.post(url, json=query)
+            if response.status_code != 200:
+                # Fallback to _all_docs if _find is not available
+                return await self._list_notes_fallback(limit, skip)
+            
+            data = response.json()
+            notes = []
+            
+            for doc in data.get("docs", []):
+                doc_type = doc.get("type")
+                try:
+                    if doc_type == "notes":
+                        note = NoteEntry(**doc)
+                    else:  # newnote
+                        note = NewEntry(**doc)
+                    notes.append(note)
+                except Exception:
+                    # Skip malformed documents
+                    continue
+            
+            return notes
+        except Exception:
+            # Fallback to original method
+            return await self._list_notes_fallback(limit, skip)
+    
+    async def _list_notes_fallback(self, limit: int, skip: int) -> List[EntryDoc]:
+        """Fallback method using _all_docs when _find is not available."""
+        try:
             url = self._get_db_url("_all_docs")
             params = {
                 "include_docs": "true",
-                "limit": limit,
+                "limit": limit * 3,  # Get more docs since we'll filter
                 "skip": skip
             }
             
@@ -97,8 +151,11 @@ class CouchDBClient:
                         else:  # newnote
                             note = NewEntry(**doc)
                         notes.append(note)
+                        
+                        # Stop when we have enough notes
+                        if len(notes) >= limit:
+                            break
                     except Exception:
-                        # Skip malformed documents
                         continue
             
             return notes
@@ -250,9 +307,97 @@ class CouchDBClient:
             return None
     
     async def search_notes(self, query: str, limit: int = 50) -> List[Tuple[ObsidianNote, float]]:
-        """Search notes by content and title."""
+        """Search notes using database-level querying for efficiency."""
         try:
-            notes = await self.list_notes(limit=1000)  # TODO: Implement proper pagination
+            # First try database-level text search
+            db_results = await self._search_notes_database(query, limit * 2)
+            
+            if db_results:
+                # Process and score the database results
+                results = []
+                query_lower = query.lower()
+                
+                for entry in db_results:
+                    processed_note = await self.process_note(entry)
+                    if not processed_note:
+                        continue
+                    
+                    score = self._calculate_search_score(processed_note, query_lower)
+                    if score > 0:
+                        results.append((processed_note, score))
+                
+                # Sort by score and limit results
+                results.sort(key=lambda x: x[1], reverse=True)
+                return results[:limit]
+            
+            # Fallback to client-side search if database search fails
+            return await self._search_notes_fallback(query, limit)
+            
+        except Exception:
+            # Fallback to client-side search
+            return await self._search_notes_fallback(query, limit)
+    
+    async def _search_notes_database(self, query: str, limit: int) -> List[EntryDoc]:
+        """Search notes using CouchDB's text search capabilities."""
+        try:
+            # Use CouchDB _find with text search
+            url = self._get_db_url("_find")
+            
+            # Build text search query
+            search_query = {
+                "selector": {
+                    "$and": [
+                        {
+                            "type": {
+                                "$in": ["notes", "newnote"]
+                            }
+                        },
+                        {
+                            "$or": [
+                                {"deleted": {"$exists": False}},
+                                {"deleted": False}
+                            ]
+                        },
+                        {
+                            "$or": [
+                                {"path": {"$regex": f"(?i).*{re.escape(query)}.*"}},
+                                {"data": {"$regex": f"(?i).*{re.escape(query)}.*"}}
+                            ]
+                        }
+                    ]
+                },
+                "limit": limit,
+                "sort": [{"mtime": "desc"}]
+            }
+            
+            response = await self.client.post(url, json=search_query)
+            if response.status_code != 200:
+                return []
+            
+            data = response.json()
+            notes = []
+            
+            for doc in data.get("docs", []):
+                doc_type = doc.get("type")
+                try:
+                    if doc_type == "notes":
+                        note = NoteEntry(**doc)
+                    else:  # newnote
+                        note = NewEntry(**doc)
+                    notes.append(note)
+                except Exception:
+                    continue
+            
+            return notes
+            
+        except Exception:
+            return []
+    
+    async def _search_notes_fallback(self, query: str, limit: int) -> List[Tuple[ObsidianNote, float]]:
+        """Fallback client-side search when database search is not available."""
+        try:
+            # Get a reasonable number of recent notes for client-side search
+            notes = await self.list_notes(limit=min(200, limit * 4))
             results = []
             
             query_lower = query.lower()
@@ -262,27 +407,37 @@ class CouchDBClient:
                 if not processed_note:
                     continue
                 
-                score = 0.0
-                
-                # Title match (higher weight)
-                if query_lower in processed_note.title.lower():
-                    score += 10.0
-                
-                # Content match
-                content_lower = processed_note.content.lower()
-                content_matches = content_lower.count(query_lower)
-                score += content_matches * 1.0
-                
-                # Tag match
-                for tag in processed_note.tags:
-                    if query_lower in tag.lower():
-                        score += 5.0
-                
+                score = self._calculate_search_score(processed_note, query_lower)
                 if score > 0:
                     results.append((processed_note, score))
             
-            # Sort by score descending
+            # Sort by score and limit results
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:limit]
+            
         except Exception:
-            return [] 
+            return []
+    
+    def _calculate_search_score(self, note: ObsidianNote, query_lower: str) -> float:
+        """Calculate search relevance score for a note."""
+        score = 0.0
+        
+        # Path/filename match (highest weight)
+        if query_lower in note.path.lower():
+            score += 15.0
+        
+        # Title match (high weight)
+        if query_lower in note.title.lower():
+            score += 10.0
+        
+        # Content match (moderate weight, but count occurrences)
+        content_lower = note.content.lower()
+        content_matches = content_lower.count(query_lower)
+        score += content_matches * 1.0
+        
+        # Tag match (high weight)
+        for tag in note.tags:
+            if query_lower in tag.lower():
+                score += 5.0
+        
+        return score 

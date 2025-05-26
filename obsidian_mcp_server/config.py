@@ -47,6 +47,16 @@ class Settings(BaseSettings):
         description="Identifier for the vault (used in URI construction)"
     )
     
+    # Rate limiting settings
+    rate_limit_requests_per_minute: int = Field(
+        default=60,
+        description="Maximum requests per minute per client"
+    )
+    rate_limit_burst_size: int = Field(
+        default=10,
+        description="Maximum burst requests allowed"
+    )
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8" 

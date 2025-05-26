@@ -13,6 +13,7 @@ from pydantic import AnyUrl
 
 from .config import Settings
 from .couchdb_client import CouchDBClient
+from .rate_limiter import RateLimiter, RateLimitExceeded
 from .types import ObsidianNote
 
 # Set up logging
@@ -26,6 +27,10 @@ class ObsidianMCPServer:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.couchdb_client = CouchDBClient(settings)
+        self.rate_limiter = RateLimiter(
+            requests_per_minute=settings.rate_limit_requests_per_minute,
+            burst_size=settings.rate_limit_burst_size
+        )
         self.app = Server("obsidian-mcp-server")
         self._setup_handlers()
     
@@ -35,10 +40,15 @@ class ObsidianMCPServer:
         @self.app.list_resources()
         async def list_resources() -> List[types.Resource]:
             """List available Obsidian notes as MCP resources."""
+            # Rate limiting
+            if not await self.rate_limiter.is_allowed("list_resources"):
+                logger.warning("Rate limit exceeded for list_resources")
+                raise ValueError("Rate limit exceeded. Please wait before making more requests.")
+            
             try:
                 # Limit to a reasonable number to prevent overwhelming AI clients
                 # AI clients should ask for specific notes rather than processing everything
-                entries = await self.couchdb_client.list_notes(limit=50)
+                entries = await self.couchdb_client.list_notes(limit=50, sort_by="mtime")
                 resources = []
                 
                 for entry in entries:
@@ -66,6 +76,11 @@ class ObsidianMCPServer:
         @self.app.read_resource()
         async def read_resource(uri: AnyUrl) -> str:
             """Read the content of a specific Obsidian note."""
+            # Rate limiting
+            if not await self.rate_limiter.is_allowed("read_resource"):
+                logger.warning("Rate limit exceeded for read_resource")
+                raise ValueError("Rate limit exceeded. Please wait before making more requests.")
+            
             try:
                 # Extract note path from URI
                 note_path = self._extract_path_from_uri(str(uri))
@@ -113,6 +128,14 @@ class ObsidianMCPServer:
         @self.app.call_tool()
         async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
             """Handle tool calls."""
+            # Rate limiting
+            if not await self.rate_limiter.is_allowed("call_tool"):
+                logger.warning("Rate limit exceeded for call_tool")
+                return [types.TextContent(
+                    type="text",
+                    text="Rate limit exceeded. Please wait before making more requests."
+                )]
+            
             if name == "search_notes":
                 try:
                     query = arguments.get("query", "")
