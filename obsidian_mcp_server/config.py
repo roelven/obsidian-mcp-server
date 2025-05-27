@@ -57,6 +57,17 @@ class Settings(BaseSettings):
         description="Maximum burst requests allowed"
     )
     
+    # Encryption settings
+    vault_passphrase: str = Field(
+        default="",
+        description="Passphrase for encrypted vault (if applicable)"
+    )
+    
+    couchdb_list_limit_for_path_search: int = Field(
+        default=500,
+        description="Maximum number of recent notes to scan when direct path lookup fails or path obfuscation is on."
+    )
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8" 

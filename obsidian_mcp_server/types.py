@@ -38,6 +38,14 @@ class NewEntry(DatabaseEntry, EntryBase):
     eden: Optional[Dict[str, Any]] = None
 
 
+class PlainEntry(DatabaseEntry, EntryBase):
+    """Entry for an encrypted note (plain type)."""
+    path: str  # FilePathWithPrefix
+    children: List[str]  # List of chunk document IDs (for encrypted chunked notes)
+    type: Literal["plain"]
+    eden: Optional[Dict[str, Any]] = None
+
+
 class EntryLeaf(DatabaseEntry):
     """Chunk document containing part of a file's content."""
     type: Literal["leaf"]
@@ -46,7 +54,7 @@ class EntryLeaf(DatabaseEntry):
 
 
 # Union type for all entry types we care about
-EntryDoc = Union[NoteEntry, NewEntry, EntryLeaf]
+EntryDoc = Union[NoteEntry, NewEntry, PlainEntry, EntryLeaf]
 
 
 class ObsidianNote(BaseModel):

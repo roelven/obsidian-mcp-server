@@ -8,6 +8,7 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 - **Seamless integration** with existing Obsidian LiveSync infrastructure
 - **Metadata extraction** including frontmatter, tags, and aliases
 - **Content reassembly** for chunked notes
+- **Handles encrypted vaults** (if `VAULT_PASSPHRASE` is provided)
 - **Docker support** for easy deployment
 - **Configurable** via environment variables
 
@@ -84,7 +85,7 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
    obsidian-mcp-server --transport sse --port 8000
    ```
 
-## Configuration
+## Setup and Configuration
 
 All configuration is done via environment variables:
 
@@ -97,7 +98,9 @@ All configuration is done via environment variables:
 | `API_KEY` | Yes | - | API key for MCP client authentication |
 | `SERVER_PORT` | No | 8000 | Port for SSE transport |
 | `USE_PATH_OBFUSCATION` | No | false | Whether LiveSync uses path obfuscation |
+| `VAULT_PASSPHRASE` | No | - | **Optional.** Passphrase for decrypting encrypted Obsidian LiveSync notes. If not set, encrypted notes will not be decrypted. |
 | `VAULT_ID` | No | default | Identifier for your vault in URIs |
+| `COUCHDB_LIST_LIMIT_FOR_PATH_SEARCH` | No | 500 | Max recent notes to scan when direct path lookup fails or path obfuscation is on. |
 
 ### CouchDB URL Format
 
@@ -106,6 +109,59 @@ Your `COUCHDB_BASE_URL` should include any secret paths or authentication prefix
 - **Direct CouchDB:** `http://localhost:5984`
 - **With Caddy proxy:** `https://vault.example.com/secret-path`
 - **Self-hosted LiveSync:** `https://your-domain.com/e=your-secret`
+
+### CouchDB Index Creation (Recommended)
+
+To ensure efficient querying of notes, especially for listing and sorting by modification time (`mtime`), it is highly recommended to create a JSON index in your CouchDB LiveSync database. This index helps CouchDB quickly find and sort notes based on their type and modification time.
+
+**Index Definition:**
+
+```json
+{
+  "index": {
+    "fields": ["type", "mtime"]
+  },
+  "name": "idx-type-mtime-sorted",
+  "type": "json"
+}
+```
+
+**How to Create the Index:**
+
+You can create this index using CouchDB's Fauxton interface or via `curl`.
+
+**Using Fauxton:**
+1.  Navigate to your CouchDB instance in your browser (e.g., `http://localhost:5984/_utils/`).
+2.  Select your LiveSync database.
+3.  Go to "All Documents" -> "New Index" (or similar, depending on Fauxton version; older versions might have it under "Design Documents" -> "New View/Index").
+4.  Choose "JSON" as the index type.
+5.  Enter the JSON definition above into the editor.
+6.  Click "Create Index".
+
+**Using `curl`:**
+
+Replace `YOUR_COUCHDB_URL`, `YOUR_DATABASE_NAME`, `YOUR_USERNAME`, and `YOUR_PASSWORD` with your actual CouchDB details.
+
+```bash
+curl -X POST \
+  YOUR_COUCHDB_URL/YOUR_DATABASE_NAME/_index \
+  -H "Content-Type: application/json" \
+  -u "YOUR_USERNAME:YOUR_PASSWORD" \
+  -d '{ \
+    "index": { \n      "fields": ["type", "mtime"] \n    }, \n    "name": "idx-type-mtime-sorted", \n    "type": "json" \n  }'
+```
+
+**Example with placeholder values:**
+```bash
+curl -X POST \
+  http://localhost:5984/my_livesync_db/_index \
+  -H "Content-Type: application/json" \
+  -u "admin:password" \
+  -d '{ \
+    "index": { \n      "fields": ["type", "mtime"] \n    }, \n    "name": "idx-type-mtime-sorted", \n    "type": "json" \n  }'
+```
+
+Creating this index will significantly improve the performance of operations like listing recent notes.
 
 ## MCP Client Integration
 
@@ -193,6 +249,7 @@ Reads the content of a specific note.
 - ✅ **Aliases** - From frontmatter
 - ✅ **Chunked notes** - Automatically reassembled
 - ✅ **Markdown content** - Full content with formatting
+- ✅ **Encrypted notes** - Decrypted if `VAULT_PASSPHRASE` is set (compatible with `octagonal-wheels`)
 - ❌ **Attachments** - Not yet supported
 - ❌ **Write operations** - Read-only for safety
 
@@ -220,6 +277,7 @@ Reads the content of a specific note.
 - **"Failed to connect to CouchDB"**: Check your URL, credentials, and network access
 - **"No notes found"**: Verify your database name and that LiveSync has synced notes
 - **"Path obfuscation errors"**: Set `USE_PATH_OBFUSCATION=true` if LiveSync uses it
+- **"Decryption failed" or "Content looks encrypted"**: Ensure `VAULT_PASSPHRASE` is correctly set in your `.env` file if your vault uses encryption. If it is set, verify the passphrase is correct. Encrypted content that cannot be decrypted will be marked.
 
 ## Security Considerations
 

@@ -10,7 +10,8 @@ import frontmatter
 import httpx
 
 from .config import Settings
-from .types import EntryDoc, EntryLeaf, NewEntry, NoteEntry, ObsidianNote
+from .encryption import decrypt_eden_content, decrypt_path, is_path_probably_obfuscated, EDEN_ENCRYPTED_KEY, try_decrypt, SALT_OF_PASSPHRASE
+from .types import EntryDoc, EntryLeaf, NewEntry, NoteEntry, PlainEntry, ObsidianNote
 
 
 class CouchDBClient:
@@ -86,6 +87,9 @@ class CouchDBClient:
                                 {"deleted": {"$exists": False}},
                                 {"deleted": False}
                             ]
+                        },
+                        {
+                            "mtime": {"$exists": True} # Ensure mtime field exists for sorting
                         }
                     ]
                 },
@@ -99,13 +103,13 @@ class CouchDBClient:
             response = await self.client.post(url, json=query)
             if response.status_code != 200:
                 # Fallback to _all_docs if _find is not available
-                print(f"DEBUG: _find failed with status {response.status_code}, falling back to _all_docs")
+                # print(f"DEBUG: _find failed with status {response.status_code}, falling back to _all_docs")
                 return await self._list_notes_fallback(limit, skip)
             
             data = response.json()
             notes = []
             total_docs = len(data.get("docs", []))
-            print(f"DEBUG: _find returned {total_docs} documents")
+            # print(f"DEBUG: _find returned {total_docs} documents")
             
             for doc in data.get("docs", []):
                 doc_type = doc.get("type")
@@ -121,9 +125,8 @@ class CouchDBClient:
                     elif doc_type == "newnote":
                         note = NewEntry(**doc)
                     elif doc_type == "plain":
-                        # Handle encrypted documents - treat as NewEntry for now
-                        # since they have children field for chunks
-                        note = NewEntry(**doc)
+                        # Handle encrypted documents
+                        note = PlainEntry(**doc)
                     else:
                         continue
                     notes.append(note)
@@ -152,13 +155,13 @@ class CouchDBClient:
             
             response = await self.client.get(url, params=params)
             if response.status_code != 200:
-                print(f"DEBUG: _all_docs failed with status {response.status_code}")
+                # print(f"DEBUG: _all_docs failed with status {response.status_code}")
                 return []
             
             data = response.json()
             notes = []
             total_rows = len(data.get("rows", []))
-            print(f"DEBUG: _all_docs returned {total_rows} rows")
+            # print(f"DEBUG: _all_docs returned {total_rows} rows")
             
             for row in data.get("rows", []):
                 doc = row.get("doc", {})
@@ -177,7 +180,7 @@ class CouchDBClient:
                         elif doc_type == "newnote":
                             note = NewEntry(**doc)
                         elif doc_type == "plain":
-                            note = NewEntry(**doc)
+                            note = PlainEntry(**doc)
                         else:
                             continue
                         notes.append(note)
@@ -195,41 +198,126 @@ class CouchDBClient:
     async def get_note_content(self, path: str) -> Optional[str]:
         """Get the full content of a note by path."""
         try:
-            # First, find the document by path
             doc = await self._find_document_by_path(path)
             if not doc:
                 return None
             
+            content_to_return: Optional[str] = None
+
             if isinstance(doc, NoteEntry):
-                # Simple note - content is directly in data field
-                return doc.data
+                raw_content = doc.data
+                if self.settings.vault_passphrase and raw_content:
+                    decrypted = try_decrypt(raw_content, self.settings.vault_passphrase)
+                    if decrypted is not None:
+                        content_to_return = decrypted
+                    elif raw_content.startswith("|%|") or raw_content.startswith("["):
+                        # If decryption failed but it looked like encrypted content
+                        content_to_return = f"[DECRYPTION FAILED NOTE: {doc.path}]"
+                    else:
+                        # Not recognized as encrypted, or passphrase not effective, keep raw
+                        content_to_return = raw_content
+                else:
+                    # No passphrase or no raw content, keep raw (which might be None or empty)
+                    content_to_return = raw_content
+
             elif isinstance(doc, NewEntry):
-                # Chunked note - need to reassemble from children
-                return await self._reassemble_chunked_content(doc.children)
+                # Chunked notes are handled by _reassemble_chunked_content, which includes decryption
+                content_to_return = await self._reassemble_chunked_content(doc.children)
             
-            return None
-        except Exception:
-            return None
+            elif isinstance(doc, PlainEntry):
+                # PlainEntry is also chunked, its content is in children, similar to NewEntry
+                if hasattr(doc, 'children') and doc.children:
+                    content_to_return = await self._reassemble_chunked_content(doc.children)
+                else:
+                    # This case should ideally not happen if PlainEntry always means chunked encrypted content.
+                    # Handle case where PlainEntry might not have children (e.g. malformed or different interpretation)
+                    # print(f"WARNING: PlainEntry {doc.path} has no children. Returning empty content.")
+                    content_to_return = f"[NO CONTENT IN PLAINENTRY CHILDREN: {doc.path}]"
+            
+            return content_to_return
+        except Exception as e:
+            # Consider logging the exception e properly for server-side diagnostics
+            # print(f"Error in get_note_content for {path}: {e}") # For debugging
+            # For the client, return a generic error message to avoid leaking details
+            return f"[ERROR GETTING CONTENT FOR {path}: Processing error]"
     
     async def _find_document_by_path(self, path: str) -> Optional[EntryDoc]:
         """Find a document by its path."""
+        doc_data: Optional[Dict] = None
+        
         if not self.settings.use_path_obfuscation:
-            # Direct lookup by path as document ID
+            # Try path as is
+            # DEBUG: print(f"DEBUG _find_document_by_path: Attempting direct lookup (non-obfuscated) for path: {path}")
             doc_data = await self.get_document(path)
-            if doc_data:
-                doc_type = doc_data.get("type")
+            if not doc_data:
+                # Try lowercase path if initial attempt failed
+                # DEBUG: print(f"DEBUG _find_document_by_path: Direct lookup failed, trying lowercase: {path.lower()}")
+                doc_data = await self.get_document(path.lower())
+        else:
+            # For obfuscated paths, direct lookup with the raw path is unlikely to work.
+            # We could try get_document(potentially_obfuscated_id_derived_from_path) if such a derivation exists,
+            # but typically we'd rely on iterating and decrypting paths.
+            # For now, if obfuscation is on, we skip direct lookup based on `path` string.
+            pass # doc_data remains None, will proceed to iteration
+
+        if doc_data:
+            doc_type = doc_data.get("type")
+            # DEBUG: print(f"DEBUG _find_document_by_path: Direct lookup found doc with type: {doc_type} for id used in lookup")
+            try:
                 if doc_type == "notes":
                     return NoteEntry(**doc_data)
                 elif doc_type == "newnote":
                     return NewEntry(**doc_data)
-        else:
-            # Need to search through documents to find by path
-            # This is less efficient but necessary when path obfuscation is enabled
-            notes = await self.list_notes(limit=1000)  # TODO: Implement pagination
-            for note in notes:
-                if note.path == path:
-                    return note
+                elif doc_type == "plain":
+                    return PlainEntry(**doc_data)
+                # DEBUG: print(f"DEBUG _find_document_by_path: Unknown doc type '{doc_type}'. Returning None.")
+                return None 
+            except Exception as e: 
+                # DEBUG: print(f"DEBUG _find_document_by_path: Direct lookup found doc, but failed to parse: {e}")
+                return None 
+
+        # If direct lookup failed, or if path obfuscation is on (in which case direct lookup with raw path is unlikely to work anyway)
+        # Fallback to iterating through notes from list_notes
+        # This is especially needed if path_obfuscation is true, or if _id != path when obfuscation is false.
         
+        # DEBUG: print(f"DEBUG _find_document_by_path: Direct lookup for '{path}' failed or path obfuscation ({self.settings.use_path_obfuscation}) might require iteration. Iterating...")
+        
+        # The list_notes already sorts by mtime desc, which is good for finding recent notes if that's relevant
+        # couchdb_list_limit_for_path_search should be high enough if the note isn't extremely old
+        notes_from_list = await self.list_notes(limit=self.settings.couchdb_list_limit_for_path_search)
+        # DEBUG: print(f"DEBUG _find_document_by_path: Iterating {len(notes_from_list)} notes after list_notes call for target: {path}")
+        
+        for note_doc_from_list in notes_from_list:
+            current_doc_path = note_doc_from_list.path # This is the 'path' field from the document
+            # DEBUG: print(f"DEBUG _find_document_by_path: Comparing target '{path}' with doc path '{current_doc_path}'")
+
+            if self.settings.use_path_obfuscation:
+                # DEBUG: print(f"DEBUG _find_document_by_path: Obfuscation ON. Comparing '{path}' with raw '{current_doc_path}' and potentially decrypted.")
+                if self.settings.vault_passphrase and is_path_probably_obfuscated(current_doc_path):
+                    try:
+                        decrypted_path_val = decrypt_path(current_doc_path, self.settings.vault_passphrase + SALT_OF_PASSPHRASE)
+                        # DEBUG: print(f"DEBUG _find_document_by_path: Decrypted '{current_doc_path}' to '{decrypted_path_val}'")
+                        if decrypted_path_val == path:
+                            # DEBUG: print(f"DEBUG _find_document_by_path: Found obfuscated path match: {decrypted_path_val}")
+                            return note_doc_from_list
+                    except ValueError:
+                        # DEBUG: print(f"DEBUG _find_document_by_path: Path decryption failed for {current_doc_path}")
+                        continue # Path decryption failed, not a match
+                # If obfuscation is on, but path doesn't look obfuscated or no passphrase,
+                # we might still compare current_doc_path == path if it's an exact match desired.
+                # However, if obfuscation is on, an unencrypted path field matching the target path is ambiguous.
+                # Sticking to: if obfuscation is on, we expect to decrypt. If it's not decryptable or doesn't look obfuscated,
+                # it's unlikely to be the target unless it's an unencrypted path in an otherwise obfuscated system (edge case).
+                # For simplicity, if use_path_obfuscation is true, we primarily rely on finding an obfuscated path that decrypts to the target.
+                # A direct match of current_doc_path == path when use_path_obfuscation is true could be added if necessary,
+                # but implies some notes might not be path-obfuscated in an obfuscated setup.
+            else: # Path obfuscation is OFF
+                # DEBUG: print(f"DEBUG _find_document_by_path: Obfuscation OFF. Comparing '{path}' with '{current_doc_path}'")
+                if current_doc_path == path:
+                    # DEBUG: print(f"DEBUG _find_document_by_path: Found non-obfuscated path match: {current_doc_path}")
+                    return note_doc_from_list
+        
+        # DEBUG: print(f"DEBUG _find_document_by_path: Path '{path}' not found after direct lookup and iteration.")
         return None
     
     async def _reassemble_chunked_content(self, chunk_ids: List[str]) -> str:
@@ -241,20 +329,39 @@ class CouchDBClient:
             if chunk_data and chunk_data.get("type") == "leaf":
                 try:
                     chunk = EntryLeaf(**chunk_data)
-                    # Check if chunk is encrypted
-                    if hasattr(chunk, 'eden') and chunk.eden:
-                        # This is an encrypted chunk - we can't read the content
-                        return "[ENCRYPTED CONTENT - Cannot read encrypted vault without passphrase]"
-                    chunks.append(chunk.data)
-                except Exception:
-                    continue
+                    chunk_content = chunk.data # Default to raw data
+
+                    # Check if chunk is Eden encrypted
+                    if hasattr(chunk, 'eden') and chunk.eden and EDEN_ENCRYPTED_KEY in chunk.eden:
+                        if self.settings.vault_passphrase:
+                            try:
+                                decrypted_eden = decrypt_eden_content(chunk.eden, self.settings.vault_passphrase)
+                                chunk_content = decrypted_eden.get("data", "")
+                            except ValueError: # Decryption failed
+                                chunk_content = f"[DECRYPTION FAILED EDEN CHUNK: {chunk_id}]"
+                                # print(f"DEBUG: Eden decryption failed for chunk {chunk_id}")
+                        else: # Passphrase needed but not provided
+                            chunk_content = f"[ENCRYPTED EDEN CHUNK NO PASS: {chunk_id}]"
+                    # If not Eden encrypted (or Eden decryption was skipped/failed), try standard decryption
+                    elif self.settings.vault_passphrase:
+                        decrypted_standard = try_decrypt(chunk.data, self.settings.vault_passphrase)
+                        if decrypted_standard is not None:
+                            chunk_content = decrypted_standard
+                        elif chunk.data.startswith("|%|") or chunk.data.startswith("[") or chunk.data.startswith("%"): 
+                             chunk_content = f"[DECRYPTION FAILED CHUNK: {chunk_id}]"
+                             # print(f"DEBUG: Standard decryption failed for chunk {chunk_id}, data starts with {chunk.data[:5]}")
+                        else: # try_decrypt returned None but not a recognized encrypted prefix
+                            chunk_content = chunk.data # Keep raw
+                            # print(f"DEBUG: Chunk {chunk_id} not decrypted, kept raw. Data starts with {chunk.data[:5]}")
+
+                    chunks.append(chunk_content)
+                except Exception as e:
+                    # Log error or handle malformed chunk_data
+                    chunks.append(f"[ERROR PROCESSING CHUNK {chunk_id}: {e}]")
+            else:
+                chunks.append(f"[MISSING CHUNK: {chunk_id}]") # Or handle missing chunk
         
-        content = "".join(chunks)
-        # If content is empty but we had chunks, it's likely encrypted
-        if not content and chunk_ids:
-            return "[ENCRYPTED CONTENT - Cannot read encrypted vault without passphrase]"
-        
-        return content
+        return "".join(chunks)
     
     def _extract_title_from_content(self, content: str, path: str) -> str:
         """Extract title from note content or use filename."""
@@ -293,28 +400,36 @@ class CouchDBClient:
     async def process_note(self, entry: EntryDoc) -> Optional[ObsidianNote]:
         """Process a raw entry into an ObsidianNote with metadata."""
         try:
-            # Get content
-            if isinstance(entry, NoteEntry):
-                content = entry.data
-                # Check if content is encrypted
-                if hasattr(entry, 'eden') and entry.eden:
-                    content = "[ENCRYPTED CONTENT - Cannot read encrypted vault without passphrase]"
-            elif isinstance(entry, NewEntry):
-                content = await self._reassemble_chunked_content(entry.children)
-            else:
-                return None
+            # Get content using the centralized get_note_content method
+            # This method handles decryption for all relevant types (NoteEntry, NewEntry, PlainEntry)
+            content = await self.get_note_content(entry.path)
+
+            if content is None:
+                # If content is None (e.g. doc not found by path, or other critical error in get_note_content before returning a string)
+                # It might be better to log this server-side and return None, 
+                # as a note without content or path is problematic.
+                # For now, matching the test script's expectation if it implies processing notes even if content fetch fails:
+                # Let's create a placeholder to indicate missing content, or return None if entry.path is also missing.
+                if not entry.path: 
+                    # print(f"DEBUG process_note: entry has no path. Entry: {entry}")
+                    return None 
+                content = "[CONTENT NOT AVAILABLE]"
             
-            # Parse frontmatter
+            # Parse frontmatter from the (potentially decrypted or error-string) content
             try:
                 post = frontmatter.loads(content)
                 frontmatter_data = post.metadata
                 content_without_frontmatter = post.content
             except Exception:
+                # If content is an error string (e.g., "[DECRYPTION FAILED...]") or not valid Markdown/frontmatter,
+                # treat the whole thing as content_without_frontmatter and empty metadata.
                 frontmatter_data = {}
-                content_without_frontmatter = content
+                content_without_frontmatter = content # Keep the error string or original content
             
             # Extract metadata
+            # Title extraction should be robust enough to handle error strings in content_without_frontmatter
             title = self._extract_title_from_content(content_without_frontmatter, entry.path)
+            # Tag extraction should also be robust
             tags = self._extract_tags_from_content(content_without_frontmatter)
             
             # Add frontmatter tags
@@ -323,29 +438,32 @@ class CouchDBClient:
                 if isinstance(fm_tags, list):
                     tags.extend(fm_tags)
                 elif isinstance(fm_tags, str):
-                    tags.append(fm_tags)
+                    # Handle space-separated tags or comma-separated tags in frontmatter string
+                    tags.extend([t.strip() for t in fm_tags.replace(',', ' ').split() if t.strip()])
             
             # Get aliases from frontmatter
             aliases = []
             if 'aliases' in frontmatter_data:
                 fm_aliases = frontmatter_data['aliases']
                 if isinstance(fm_aliases, list):
-                    aliases = fm_aliases
+                    aliases = [str(a) for a in fm_aliases if a] # Ensure strings and filter empty
                 elif isinstance(fm_aliases, str):
-                    aliases = [fm_aliases]
+                    aliases = [a.strip() for a in fm_aliases.split(',') if a.strip()] # Comma-separated
             
             return ObsidianNote(
                 path=entry.path,
                 title=title,
-                content=content,
+                content=content, # This is the original content string from get_note_content
                 created_at=entry.ctime,
                 modified_at=entry.mtime,
-                size=entry.size,
+                size=entry.size, # This might not be accurate if content was decrypted/is error string
                 tags=list(set(tags)),  # Remove duplicates
                 aliases=aliases,
                 frontmatter=frontmatter_data
             )
-        except Exception:
+        except Exception as e:
+            # Log e for server-side debugging
+            # print(f"Error processing note {entry.path if hasattr(entry, 'path') else 'unknown'}: {e}")
             return None
     
     async def search_notes(self, query: str, limit: int = 50) -> List[Tuple[ObsidianNote, float]]:
@@ -432,7 +550,7 @@ class CouchDBClient:
                         elif doc_type == "newnote":
                             note = NewEntry(**doc)
                         elif doc_type == "plain":
-                            note = NewEntry(**doc)
+                            note = PlainEntry(**doc)
                         else:
                             continue
                         notes.append(note)
