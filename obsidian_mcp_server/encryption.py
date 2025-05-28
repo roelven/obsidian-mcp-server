@@ -11,6 +11,7 @@ import json
 import struct
 import urllib.parse
 from typing import Optional, Tuple
+import logging
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -20,6 +21,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 # Constants from LiveSync
 SALT_OF_PASSPHRASE = "rHGMPtr6oWw7VSa3W3wpa8fT8U"
 EDEN_ENCRYPTED_KEY = "h:++encrypted"
+
+logger = logging.getLogger(__name__)
 
 
 def _derive_key(passphrase: str, salt: bytes, iterations: int = 100000) -> bytes:
@@ -96,90 +99,79 @@ def decrypt(encrypted_data: str, passphrase: str, auto_calculate_iterations: boo
     Raises:
         ValueError: If decryption fails or data is invalid
     """
+    logger.debug(f"decrypt: Attempting to decrypt data starting with: {encrypted_data[:20] if encrypted_data else 'None'}")
     try:
         iv_bytes: bytes
         salt_bytes: bytes
         encrypted_content_bytes: bytes
-        iterations = 100000 # octagonal-wheels uses 100000 if autoCalculateIterations is false
+        iterations = 100000
 
         if encrypted_data.startswith("|%|"):
-            # This is the V2 format with embedded IV and Salt (both 32 bytes raw)
-            # Parsed from a single base64 block after the |%|
             iv_bytes, salt_bytes, encrypted_content_bytes = _parse_encrypted_data(encrypted_data)
+            logger.debug(f"decrypt: Parsed as |%| format. IV len: {len(iv_bytes)}, Salt len: {len(salt_bytes)}, Ciphertext len: {len(encrypted_content_bytes)}")
         elif encrypted_data.startswith("%"):
-            # This is the V2 format variant used by encrypt() in octagonal-wheels
-            # %<IV_hex(32chars)><Salt_hex(32chars)><Ciphertext_base64>
-            # IV is 16 bytes, Salt is 16 bytes.
-            if len(encrypted_data) < 1 + 32 + 32 + 1: # % + hex_iv + hex_salt + min_1_char_base64
+            if len(encrypted_data) < 1 + 32 + 32 + 1:
                 raise ValueError("Encrypted data string (starting with '%') too short.")
-
             iv_hex = encrypted_data[1:33]
             salt_hex = encrypted_data[33:65]
             ciphertext_b64 = encrypted_data[65:]
-
             try:
-                iv_bytes = bytes.fromhex(iv_hex) # 16 bytes
-                salt_bytes = bytes.fromhex(salt_hex) # 16 bytes
+                iv_bytes = bytes.fromhex(iv_hex)
+                salt_bytes = bytes.fromhex(salt_hex)
             except ValueError as e_hex:
                 raise ValueError(f"Failed to decode hex IV/Salt for '%' prefixed data: {e_hex}")
-
             if len(iv_bytes) != 16:
                 raise ValueError(f"Decoded IV for '%' prefixed data is not 16 bytes (got {len(iv_bytes)})")
             if len(salt_bytes) != 16:
                 raise ValueError(f"Decoded Salt for '%' prefixed data is not 16 bytes (got {len(salt_bytes)})")
-
             try:
                 encrypted_content_bytes = base64.b64decode(ciphertext_b64)
             except base64.binascii.Error as e_b64:
-                # If base64 decoding fails, it might be v1 JSON that coincidentally starts with %
-                # and also failed the previous hex/length checks.
-                # Fallback to v1 parsing.
-                try:
+                try: # Fallback to V1 if B64 fails for ciphertext_b64
+                    logger.debug("decrypt: '%' prefixed data, ciphertext b64decode failed, trying V1 JSON parse as fallback.")
                     iv_bytes, salt_bytes, encrypted_content_bytes = _parse_encrypted_data_v1(encrypted_data)
-                except ValueError as ve_v1:
+                except ValueError as ve_v1: # Renamed to avoid confusion with outer ve
+                    logger.error(f"decrypt: '%' prefixed data failed direct hex/base64 and also V1 JSON parsing. Hex/B64 error: {e_b64}. V1 error: {ve_v1}", exc_info=True)
                     raise ValueError(f"Data starting with '%' failed hex/base64 parsing (IV/Salt/Ciphertext) and also failed v1 JSON parsing. Hex/B64 error: {e_b64}. V1 error: {ve_v1}")
-
-        else:
-            # Try v1 format (JSON array)
+            logger.debug(f"decrypt: Parsed as % format. IV len: {len(iv_bytes)}, Salt len: {len(salt_bytes)}, Ciphertext len: {len(encrypted_content_bytes)}")
+        else: # Assumed V1 JSON format if not |%| or %
             iv_bytes, salt_bytes, encrypted_content_bytes = _parse_encrypted_data_v1(encrypted_data)
+            logger.debug(f"decrypt: Parsed as V1 JSON format. IV len: {len(iv_bytes)}, Salt len: {len(salt_bytes)}, Ciphertext len: {len(encrypted_content_bytes)}")
         
-        # Derive the key
-        # Note: _derive_key expects salt to be bytes, iterations defaults to 100000 in its own definition
-        # but we pass it explicitly here for clarity from octagonal-wheels.
         key = _derive_key(passphrase, salt_bytes, iterations=iterations)
         
         aesgcm = AESGCM(key)
+        nonce = iv_bytes
+        # The check `if len(nonce) not in [12, 16]: pass` was here, 
+        # but AESGCM typically requires 12-byte nonces for GCM mode.
+        # However, octagonal-wheels might use 16-byte nonces (IVs).
+        # The cryptography library's AESGCM might handle this or it might be specific to an implementation detail.
+        # For now, leaving it to the library to validate nonce length.
         
-        # Nonce for AES-GCM:
-        # octagonal-wheels TS passes the full 16-byte IV to WebCrypto's decrypt.
-        # Let's try passing the full 16-byte IV to python-cryptography's AESGCM decrypt as the nonce.
-        # While 12 bytes is typical for GCM, the library might support other lengths if consistent with encryption.
-        nonce = iv_bytes # Use the full 16-byte IV as the nonce
-        if len(nonce) not in [12, 16]: # Common GCM nonces are 12B, but WebCrypto might effectively use 16B if provided
-             # Re-checking documentation, python-cryptography AESGCM nonce can be any length, but 12 is recommended for performance/security.
-             # However, we must match what was used for encryption.
-             pass # Allow it if it's 16 bytes, as per TS WebCrypto usage.
-
         first_try_error = None
         try:
             decrypted = aesgcm.decrypt(nonce, encrypted_content_bytes, None)
             return decrypted.decode('utf-8')
         except Exception as e_first:
             first_try_error = e_first
-            pass 
-
+            logger.error(f"decrypt: aesgcm.decrypt failed directly. Error: {repr(e_first)}. Nonce len: {len(nonce)}, Ciphertext len: {len(encrypted_content_bytes)}", exc_info=True)
+            # Pass through to raise the error below, this log is for context.
+        
+        # This structure ensures that if aesgcm.decrypt raises an error, it's captured and re-raised.
         if first_try_error:
-            # If the V2 style from octagonal-wheels encrypt() was `%<hexIV(16B)><hexSalt(16B)><Base64Cipher>`,
-            # and it still failed with InvalidTag, the IV interpretation for nonce might be the issue.
-            # WebCrypto's AES-GCM takes the full IV. Python's cryptography might need something specific if the 16B IV isn't just a 12B nonce + 4B counter.
-            # However, 12-byte nonce is standard. The error is more likely key or data.
             raise ValueError(f"Decryption failed. Error: {repr(first_try_error)}")
         else:
-            raise ValueError("Decryption failed due to an unknown issue within the decryption attempts.")
-            
+            # This path should not be reached if aesgcm.decrypt always raises an exception on failure.
+            # It's a safeguard.
+            raise ValueError("Decryption failed due to an unknown issue after AESGCM attempt (no exception caught but no result).")
+
     except ValueError as ve: 
-        raise ve 
+        # This will catch ValueErrors raised by parsing or the explicit re-raise above.
+        logger.error(f"decrypt: ValueError during decryption process: {ve!r}", exc_info=True)
+        raise ve # Re-raise the ValueError
     except Exception as e:
+        # Catch any other unexpected exceptions.
+        logger.error(f"decrypt: Unexpected exception during decryption process: {e!r}", exc_info=True)
         raise ValueError(f"Failed to decrypt data (outer error). Error: {repr(e)}")
 
 
@@ -197,7 +189,9 @@ def try_decrypt(encrypted_data: str, passphrase: str, auto_calculate_iterations:
     """
     try:
         return decrypt(encrypted_data, passphrase, auto_calculate_iterations)
-    except:
+    except Exception as e: 
+        # Log the error with some context but return None as per function's contract.
+        logger.error(f"encryption.try_decrypt: Exception during decrypt call: {e!r}. Data (first 10): '{encrypted_data[:10] if encrypted_data else 'None'}'", exc_info=True)
         return None
 
 

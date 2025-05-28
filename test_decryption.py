@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Test script to verify decryption functionality."""
 
+# import logging # Logging configuration removed
+
 import asyncio
 import os
 from obsidian_mcp_server.config import Settings
@@ -92,6 +94,39 @@ async def test_decryption():
         else:
             print(f"   ✗ Failed to find specific note document for path: {NOTE_PATH_TO_TEST} using _find_document_by_path")
         # --- End of specific note test ---
+        
+        # --- ADD FOCUSED CHUNK DECRYPTION TEST HERE ---
+        print("\n3.6. Testing specific chunk decryption for 'UP Intros - Tedy.md'...")
+        # Replace with an actual chunk ID from your logs for this note
+        # e.g., the first one from your log: "h:+5v3ou6aumsx9"
+        TEST_CHUNK_ID = "h:+5v3ou6aumsx9" # MAKE SURE THIS IS A VALID CHUNK ID FOR THE NOTE
+        
+        if not settings.vault_passphrase:
+            print(f"   SKIPPING: Vault passphrase not provided.")
+        else:
+            print(f"   Attempting to fetch and decrypt chunk: {TEST_CHUNK_ID}")
+            chunk_doc_data = await client.get_document(TEST_CHUNK_ID)
+            
+            if not chunk_doc_data:
+                print(f"   ✗ FAILED to fetch chunk document for ID: {TEST_CHUNK_ID}")
+            elif chunk_doc_data.get("type") != "leaf":
+                print(f"   ✗ Document {TEST_CHUNK_ID} is not of type 'leaf'. Actual type: {chunk_doc_data.get('type')}")
+            else:
+                raw_chunk_data = chunk_doc_data.get("data")
+                if not raw_chunk_data:
+                    print(f"   ✗ Chunk {TEST_CHUNK_ID} has no 'data' field or it's empty.")
+                else:
+                    print(f"   Raw chunk data (first 50 chars): {raw_chunk_data[:50]}")
+                    # Directly use the encryption module's try_decrypt
+                    from obsidian_mcp_server.encryption import try_decrypt as encryption_try_decrypt
+                    decrypted_chunk_content = encryption_try_decrypt(raw_chunk_data, settings.vault_passphrase)
+                    
+                    if decrypted_chunk_content is not None:
+                        print(f"   ✓ SUCCESS: Chunk {TEST_CHUNK_ID} decrypted directly.")
+                        print(f"   Decrypted content (first 50 chars): {decrypted_chunk_content[:50]}")
+                    else:
+                        print(f"   ✗ FAILED: try_decrypt returned None for chunk {TEST_CHUNK_ID}.")
+        # --- End of focused chunk decryption test ---
         
         # Test search
         print("\n4. Testing search functionality...")

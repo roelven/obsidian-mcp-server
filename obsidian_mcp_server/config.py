@@ -1,6 +1,6 @@
 """Configuration management for Obsidian MCP Server."""
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -62,6 +62,13 @@ class Settings(BaseSettings):
         default="",
         description="Passphrase for encrypted vault (if applicable)"
     )
+
+    @field_validator("vault_passphrase")
+    @classmethod
+    def strip_vault_passphrase(cls, v: str) -> str:
+        if v:
+            return v.strip()
+        return v
     
     couchdb_list_limit_for_path_search: int = Field(
         default=500,

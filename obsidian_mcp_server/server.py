@@ -16,8 +16,15 @@ from .couchdb_client import CouchDBClient
 from .rate_limiter import RateLimiter, RateLimitExceeded
 from .types import ObsidianNote
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,  # Changed from DEBUG to WARNING
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler() # Ensure logs go to stdout/stderr for Docker
+    ]
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,6 +224,14 @@ class ObsidianMCPServer:
                             if note.tags:
                                 response_lines.append(f"Tags: {', '.join(note.tags)}")
                             response_lines.append(f"URI: {self._create_note_uri(note.path)}")
+                            
+                            # If only one result and it was a specific query, include content
+                            if len(results) == 1 and query:
+                                response_lines.append("\n---\n") # Separator
+                                if note.content:
+                                    response_lines.append(note.content)
+                                else:
+                                    response_lines.append("[Content not available or note is empty]")
                             response_lines.append("")  # Empty line
                         
                         return [types.TextContent(

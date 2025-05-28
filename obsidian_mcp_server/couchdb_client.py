@@ -5,6 +5,7 @@ import json
 import re
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin
+import logging
 
 import frontmatter
 import httpx
@@ -13,12 +14,14 @@ from .config import Settings
 from .encryption import decrypt_eden_content, decrypt_path, is_path_probably_obfuscated, EDEN_ENCRYPTED_KEY, try_decrypt, SALT_OF_PASSPHRASE
 from .types import EntryDoc, EntryLeaf, NewEntry, NoteEntry, PlainEntry, ObsidianNote
 
+logger = logging.getLogger(__name__)
 
 class CouchDBClient:
     """Client for interacting with CouchDB containing Obsidian LiveSync data."""
     
     def __init__(self, settings: Settings):
         self.settings = settings
+        
         self.base_url = settings.couchdb_base_url.rstrip('/')
         self.database_name = settings.couchdb_database_name
         self.auth = (settings.couchdb_user, settings.couchdb_password)
@@ -322,37 +325,55 @@ class CouchDBClient:
     
     async def _reassemble_chunked_content(self, chunk_ids: List[str]) -> str:
         """Reassemble content from chunk documents."""
+        logger = logging.getLogger(__name__) # Get logger instance
+
+        logger.debug(f"_reassemble_chunked_content: Attempting to reassemble {len(chunk_ids)} chunks: {chunk_ids}")
         chunks = []
         
         for chunk_id in chunk_ids:
+            logger.debug(f"_reassemble_chunked_content: Processing chunk_id: {chunk_id}")
             chunk_data = await self.get_document(chunk_id)
             if chunk_data and chunk_data.get("type") == "leaf":
                 try:
                     chunk = EntryLeaf(**chunk_data)
                     chunk_content = chunk.data # Default to raw data
+                    logger.debug(f"_reassemble_chunked_content: Chunk {chunk_id} raw data (first 50): {chunk_content[:50] if chunk_content else 'None'}")
 
                     # Check if chunk is Eden encrypted
                     if hasattr(chunk, 'eden') and chunk.eden and EDEN_ENCRYPTED_KEY in chunk.eden:
+                        logger.debug(f"_reassemble_chunked_content: Chunk {chunk_id} identified as Eden encrypted.")
                         if self.settings.vault_passphrase:
+                            logger.debug(f"_reassemble_chunked_content: Attempting Eden decryption for {chunk_id}. Passphrase present: True")
                             try:
                                 decrypted_eden = decrypt_eden_content(chunk.eden, self.settings.vault_passphrase)
                                 chunk_content = decrypted_eden.get("data", "")
+                                logger.debug(f"_reassemble_chunked_content: Eden decryption for {chunk_id} successful.")
                             except ValueError: # Decryption failed
                                 chunk_content = f"[DECRYPTION FAILED EDEN CHUNK: {chunk_id}]"
-                                # print(f"DEBUG: Eden decryption failed for chunk {chunk_id}")
+                                logger.warning(f"_reassemble_chunked_content: Eden decryption FAILED for chunk {chunk_id}.")
                         else: # Passphrase needed but not provided
                             chunk_content = f"[ENCRYPTED EDEN CHUNK NO PASS: {chunk_id}]"
+                            logger.warning(f"_reassemble_chunked_content: Eden chunk {chunk_id} requires passphrase, but none provided.")
                     # If not Eden encrypted (or Eden decryption was skipped/failed), try standard decryption
                     elif self.settings.vault_passphrase:
+                        logger.debug(f"_reassemble_chunked_content: Attempting standard decryption for {chunk_id}. Passphrase present: True")
                         decrypted_standard = try_decrypt(chunk.data, self.settings.vault_passphrase)
                         if decrypted_standard is not None:
                             chunk_content = decrypted_standard
-                        elif chunk.data.startswith("|%|") or chunk.data.startswith("[") or chunk.data.startswith("%"): 
+                            logger.debug(f"_reassemble_chunked_content: Standard decryption for {chunk_id} successful.")
+                        elif chunk.data and (chunk.data.startswith("|%|") or chunk.data.startswith("[") or chunk.data.startswith("%")):
                              chunk_content = f"[DECRYPTION FAILED CHUNK: {chunk_id}]"
-                             # print(f"DEBUG: Standard decryption failed for chunk {chunk_id}, data starts with {chunk.data[:5]}")
+                             logger.warning(f"_reassemble_chunked_content: Standard decryption FAILED for chunk {chunk_id}. Data prefix: {chunk.data[:10]}")
                         else: # try_decrypt returned None but not a recognized encrypted prefix
                             chunk_content = chunk.data # Keep raw
-                            # print(f"DEBUG: Chunk {chunk_id} not decrypted, kept raw. Data starts with {chunk.data[:5]}")
+                            logger.debug(f"_reassemble_chunked_content: Chunk {chunk_id} not recognized as encrypted or decryption not attempted/failed quietly; kept raw.")
+                    else: # No vault_passphrase was provided for standard decryption path
+                        logger.debug(f"_reassemble_chunked_content: No passphrase for standard decryption of chunk {chunk_id}. Passphrase present: False")
+                        if chunk.data and (chunk.data.startswith("|%|") or chunk.data.startswith("[") or chunk.data.startswith("%")):
+                            chunk_content = f"[ENCRYPTED CHUNK NO PASS: {chunk_id}]"
+                            logger.warning(f"_reassemble_chunked_content: Standard chunk {chunk_id} requires passphrase, but none provided.")
+                        else:
+                            chunk_content = chunk.data # Keep raw, likely not encrypted
 
                     chunks.append(chunk_content)
                 except Exception as e:

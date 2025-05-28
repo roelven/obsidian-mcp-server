@@ -1,4 +1,3 @@
-
 services:
   obsidian-mcp-server:
     build: .
@@ -18,6 +17,7 @@ services:
       # LiveSync settings
       USE_PATH_OBFUSCATION: ${USE_PATH_OBFUSCATION:-false}
       VAULT_ID: ${VAULT_ID:-default}
+      VAULT_PASSPHRASE: ${VAULT_PASSPHRASE}
     
     # Health check
     healthcheck:
