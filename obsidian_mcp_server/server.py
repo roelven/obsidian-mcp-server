@@ -108,11 +108,11 @@ class ObsidianMCPServer:
         @self.app.list_tools()
         async def list_tools() -> List[types.Tool]:
             """List available tools."""
-            logger.info("Tools requested - returning search_notes and browse_notes")
+            logger.info("Tools requested - returning search_notes, browse_notes, and get_recent_note")
             return [
                 types.Tool(
                     name="search_notes",
-                    description="Search through Obsidian notes by title, content, or tags. Leave query empty to browse recent notes.",
+                    description="Search through Obsidian notes by title, content, or tags. Leave query empty to browse recent notes. Automatically includes full content for small result sets.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -127,6 +127,11 @@ class ObsidianMCPServer:
                                 "default": 10,
                                 "minimum": 1,
                                 "maximum": 50
+                            },
+                            "include_content": {
+                                "type": "boolean",
+                                "description": "Whether to include full note content in results. Auto-enabled for small result sets (≤3 notes).",
+                                "default": False
                             }
                         },
                         "required": []
@@ -134,7 +139,7 @@ class ObsidianMCPServer:
                 ),
                 types.Tool(
                     name="browse_notes",
-                    description="Browse recent Obsidian notes without searching. Use this to discover available notes.",
+                    description="Browse recent Obsidian notes without searching. Automatically includes full content for small result sets to improve user experience.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -149,6 +154,27 @@ class ObsidianMCPServer:
                                 "type": "string",
                                 "description": "Sort order for notes",
                                 "enum": ["mtime", "ctime", "path"],
+                                "default": "mtime"
+                            },
+                            "include_content": {
+                                "type": "boolean",
+                                "description": "Whether to include full note content in results. Auto-enabled for small result sets (≤3 notes).",
+                                "default": False
+                            }
+                        },
+                        "required": []
+                    }
+                ),
+                types.Tool(
+                    name="get_recent_note",
+                    description="Get the most recent note with full content. Optimized for 'show me the latest note' queries.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "sort_by": {
+                                "type": "string",
+                                "description": "How to determine 'most recent'",
+                                "enum": ["mtime", "ctime"],
                                 "default": "mtime"
                             }
                         },
@@ -173,6 +199,7 @@ class ObsidianMCPServer:
                 try:
                     query = arguments.get("query", "").strip()
                     limit = min(arguments.get("limit", 10), 50)  # Cap at 50
+                    include_content = arguments.get("include_content", False)
                     
                     if not query:
                         # If no query, browse recent notes
@@ -189,15 +216,31 @@ class ObsidianMCPServer:
                                 text="No notes found in your vault"
                             )]
                         
+                        # Auto-enable content inclusion for small result sets
+                        should_include_content = include_content or len(notes) <= 3
+                        
                         # Format browse results
                         response_lines = [f"Recent {len(notes)} notes from your vault:\n"]
                         
-                        for note in notes:
+                        for i, note in enumerate(notes):
                             response_lines.append(f"**{note.title}**")
                             response_lines.append(f"Path: {note.path}")
                             if note.tags:
                                 response_lines.append(f"Tags: {', '.join(note.tags)}")
                             response_lines.append(f"URI: {self._create_note_uri(note.path)}")
+                            
+                            # Include content for small result sets or when requested
+                            if should_include_content:
+                                response_lines.append("\n---\n")  # Separator
+                                if note.content:
+                                    # Truncate very long content for readability
+                                    content = note.content
+                                    if len(content) > 3000:
+                                        content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
+                                    response_lines.append(content)
+                                else:
+                                    response_lines.append("[Content not available or note is empty]")
+                            
                             response_lines.append("")  # Empty line
                         
                         return [types.TextContent(
@@ -214,6 +257,9 @@ class ObsidianMCPServer:
                                 text=f"No notes found matching '{query}'"
                             )]
                         
+                        # Auto-enable content inclusion for small result sets
+                        should_include_content = include_content or len(results) <= 3
+                        
                         # Format search results
                         response_lines = [f"Found {len(results)} notes matching '{query}':\n"]
                         
@@ -225,13 +271,18 @@ class ObsidianMCPServer:
                                 response_lines.append(f"Tags: {', '.join(note.tags)}")
                             response_lines.append(f"URI: {self._create_note_uri(note.path)}")
                             
-                            # If only one result and it was a specific query, include content
-                            if len(results) == 1 and query:
-                                response_lines.append("\n---\n") # Separator
+                            # Include content for small result sets or when requested
+                            if should_include_content:
+                                response_lines.append("\n---\n")  # Separator
                                 if note.content:
-                                    response_lines.append(note.content)
+                                    # Truncate very long content for readability
+                                    content = note.content
+                                    if len(content) > 3000:
+                                        content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
+                                    response_lines.append(content)
                                 else:
                                     response_lines.append("[Content not available or note is empty]")
+                            
                             response_lines.append("")  # Empty line
                         
                         return [types.TextContent(
@@ -250,6 +301,7 @@ class ObsidianMCPServer:
                 try:
                     limit = min(arguments.get("limit", 20), 50)  # Cap at 50
                     sort_by = arguments.get("sort_by", "mtime")
+                    include_content = arguments.get("include_content", False)
                     
                     # Get recent notes
                     entries = await self.couchdb_client.list_notes(limit=limit, sort_by=sort_by)
@@ -265,6 +317,9 @@ class ObsidianMCPServer:
                             text="No notes found in your vault"
                         )]
                     
+                    # Auto-enable content inclusion for small result sets
+                    should_include_content = include_content or len(notes) <= 3
+                    
                     # Format browse results
                     sort_desc = {"mtime": "recently modified", "ctime": "recently created", "path": "alphabetical"}
                     response_lines = [f"Browsing {len(notes)} {sort_desc.get(sort_by, 'recent')} notes:\n"]
@@ -275,6 +330,19 @@ class ObsidianMCPServer:
                         if note.tags:
                             response_lines.append(f"Tags: {', '.join(note.tags)}")
                         response_lines.append(f"URI: {self._create_note_uri(note.path)}")
+                        
+                        # Include content for small result sets or when requested
+                        if should_include_content:
+                            response_lines.append("\n---\n")  # Separator
+                            if note.content:
+                                # Truncate very long content for readability
+                                content = note.content
+                                if len(content) > 3000:
+                                    content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
+                                response_lines.append(content)
+                            else:
+                                response_lines.append("[Content not available or note is empty]")
+                        
                         response_lines.append("")  # Empty line
                     
                     return [types.TextContent(
@@ -287,6 +355,50 @@ class ObsidianMCPServer:
                     return [types.TextContent(
                         type="text",
                         text=f"Error browsing notes: {e}"
+                    )]
+            elif name == "get_recent_note":
+                logger.info(f"get_recent_note tool called with arguments: {arguments}")
+                try:
+                    sort_by = arguments.get("sort_by", "mtime")
+                    
+                    # Get the most recent note
+                    note = await self.couchdb_client.get_recent_note(sort_by)
+                    if not note:
+                        return [types.TextContent(
+                            type="text",
+                            text="No recent note found in your vault"
+                        )]
+                    
+                    # Format recent note
+                    response_lines = [f"Most recent note in your vault:\n"]
+                    response_lines.append(f"**{note.title}**")
+                    response_lines.append(f"Path: {note.path}")
+                    if note.tags:
+                        response_lines.append(f"Tags: {', '.join(note.tags)}")
+                    response_lines.append(f"URI: {self._create_note_uri(note.path)}")
+                    
+                    # Include content for small result sets or when requested
+                    if note.content:
+                        # Truncate very long content for readability
+                        content = note.content
+                        if len(content) > 3000:
+                            content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
+                        response_lines.append("\n---\n")  # Separator
+                        response_lines.append(content)
+                    else:
+                        response_lines.append("[Content not available or note is empty]")
+                    
+                    response_lines.append("")  # Empty line
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text="\n".join(response_lines)
+                    )]
+                except Exception as e:
+                    logger.error(f"Error in get_recent_note tool: {e}")
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Error getting recent note: {e}"
                     )]
             else:
                 return [types.TextContent(

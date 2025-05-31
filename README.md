@@ -4,7 +4,9 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 
 ## Features
 
-- **Read-only access** to your Obsidian notes via MCP
+- **Read-only access** to your Obsidian notes via MCP protocol version **2025-03-26**
+- **Performance-optimized** resource listing (10 recent notes) with comprehensive search tools
+- **Enhanced UX**: Automatic content inclusion for small result sets (≤3 notes) to reduce back-and-forth
 - **Seamless integration** with existing Obsidian LiveSync infrastructure
 - **Metadata extraction** including frontmatter, tags, and aliases
 - **Content reassembly** for chunked notes
@@ -16,7 +18,7 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 
 ```
 [AI Clients (ChatGPT, Claude)] 
-      ↓ (MCP Protocol)
+      ↓ (MCP Protocol - stdio/SSE)
 [Obsidian MCP Server] 
       ↓ (CouchDB API)
 [Your LiveSync CouchDB Instance]
@@ -95,7 +97,7 @@ All configuration is done via environment variables:
 | `COUCHDB_DATABASE_NAME` | Yes | - | Name of your LiveSync database |
 | `COUCHDB_USER` | Yes | - | CouchDB username |
 | `COUCHDB_PASSWORD` | Yes | - | CouchDB password |
-| `API_KEY` | Yes | - | API key for MCP client authentication |
+| `API_KEY` | Yes | - | API key for future HTTP endpoint authentication |
 | `SERVER_PORT` | No | 8000 | Port for SSE transport |
 | `USE_PATH_OBFUSCATION` | No | false | Whether LiveSync uses path obfuscation |
 | `VAULT_PASSPHRASE` | No | - | **Optional.** Passphrase for decrypting encrypted Obsidian LiveSync notes. If not set, encrypted notes will not be decrypted. |
@@ -188,25 +190,45 @@ Add to your Claude Desktop configuration:
 ### Custom MCP Client
 
 ```python
-import mcp
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client
 
 # Connect to the server
-async with mcp.ClientSession("http://localhost:8000") as session:
-    # List available notes
-    resources = await session.list_resources()
-    
-    # Read a specific note
-    content = await session.read_resource(resources[0].uri)
-    print(content)
+async with stdio_client() as streams:
+    async with ClientSession(streams[0], streams[1]) as session:
+        # Initialize the connection
+        await session.initialize()
+        
+        # Get the most recent note with content in one call
+        recent_note = await session.call_tool("get_recent_note", {})
+        print("Most recent note:", recent_note)
+        
+        # Search for specific content (auto-includes content for ≤3 results)
+        search_results = await session.call_tool("search_notes", {"query": "project", "limit": 3})
+        print("Search results with content:", search_results)
+        
+        # Browse recent notes (auto-includes content for ≤3 results)
+        browse_results = await session.call_tool("browse_notes", {"limit": 2})
+        print("Recent notes with content:", browse_results)
+        
+        # List available notes (metadata only, for discovery)
+        resources = await session.list_resources()
+        
+        # Read a specific note if needed
+        if resources.resources:
+            content = await session.read_resource(resources.resources[0].uri)
+            print("Specific note content:", content)
 ```
 
 ## API Reference
 
-The server implements the MCP Resource protocol:
+The server implements the MCP protocol version **2025-03-26**:
 
-### `resources/list`
+### Resources
 
-Lists all available Obsidian notes.
+#### `resources/list`
+
+Lists up to 10 recent Obsidian notes for performance optimization. For comprehensive note discovery, use the search and browse tools.
 
 **Response:**
 ```json
@@ -222,12 +244,12 @@ Lists all available Obsidian notes.
 }
 ```
 
-### `resources/read`
+#### `resources/read`
 
 Reads the content of a specific note.
 
 **Parameters:**
-- `uri`: The resource URI from `resources/list`
+- `uri`: The resource URI from `resources/list` or tool output
 
 **Response:**
 ```json
@@ -242,6 +264,33 @@ Reads the content of a specific note.
 }
 ```
 
+### Tools
+
+#### `search_notes`
+
+Search through notes by title, content, or tags with rich metadata and relevance scoring. **Automatically includes full content for small result sets (≤3 notes)** to improve user experience.
+
+**Parameters:**
+- `query` (string): Search query (leave empty to browse recent notes)
+- `limit` (integer): Maximum results (default: 10, max: 50)
+- `include_content` (boolean): Force content inclusion (auto-enabled for ≤3 results)
+
+#### `browse_notes`
+
+Browse recent notes with sorting options. **Automatically includes full content for small result sets (≤3 notes)** to improve user experience.
+
+**Parameters:**
+- `limit` (integer): Maximum results (default: 20, max: 50)
+- `sort_by` (string): Sort order - "mtime", "ctime", or "path"
+- `include_content` (boolean): Force content inclusion (auto-enabled for ≤3 results)
+
+#### `get_recent_note`
+
+Get the most recent note with full content. **Optimized for "show me the latest note" queries** - returns complete note content in a single call.
+
+**Parameters:**
+- `sort_by` (string): How to determine "most recent" - "mtime" or "ctime" (default: "mtime")
+
 ## Supported Note Features
 
 - ✅ **Frontmatter** - YAML metadata is preserved
@@ -252,6 +301,13 @@ Reads the content of a specific note.
 - ✅ **Encrypted notes** - Decrypted if `VAULT_PASSPHRASE` is set (compatible with `octagonal-wheels`)
 - ❌ **Attachments** - Not yet supported
 - ❌ **Write operations** - Read-only for safety
+
+## Future Enhancements
+
+- **Custom HTTP API**: Bearer token authentication and custom endpoints for advanced deployment scenarios
+- **Write Operations**: Note creation and modification capabilities
+- **Real-time Updates**: MCP resource subscriptions and live vault change notifications
+- **Advanced Search**: Enhanced querying with date ranges, tag filters, and graph traversal
 
 ## Troubleshooting
 
@@ -324,4 +380,4 @@ MIT License - see LICENSE file for details.
 
 - [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-- [Claude Desktop](https://claude.ai/desktop) 
+- [Claude Desktop](https://claude.ai/desktop)

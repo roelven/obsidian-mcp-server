@@ -635,3 +635,17 @@ class CouchDBClient:
                 score += 5.0
         
         return score 
+
+    async def get_recent_note(self, sort_by: str = "mtime") -> Optional[ObsidianNote]:
+        """Get the single most recent note with full content."""
+        try:
+            # Get just one recent note
+            entries = await self.list_notes(limit=1, sort_by=sort_by)
+            if not entries:
+                return None
+            
+            # Process the note to get full content
+            return await self.process_note(entries[0])
+        except Exception as e:
+            logger.error(f"Error getting recent note: {e}")
+            return None 
