@@ -9,6 +9,7 @@ import logging
 
 import frontmatter
 import httpx
+import anyio
 
 from .config import Settings
 from .encryption import decrypt_eden_content, decrypt_path, is_path_probably_obfuscated, EDEN_ENCRYPTED_KEY, try_decrypt, SALT_OF_PASSPHRASE
@@ -35,6 +36,7 @@ class CouchDBClient:
             headers={
                 "Authorization": f"Basic {auth_header}",
                 "Content-Type": "application/json",
+                "Accept-Encoding": "gzip"
             },
             timeout=30.0
         )
@@ -99,8 +101,8 @@ class CouchDBClient:
                 "limit": limit * 3,  # Get more docs since we'll filter for .md files
                 "skip": skip,
                 "sort": [
-                    {sort_by: "desc"}  # Sort by modification time (newest first)
-                ]
+                    {sort_by: "desc"}
+                ],
             }
             
             response = await self.client.post(url, json=query)
@@ -118,8 +120,8 @@ class CouchDBClient:
                 doc_type = doc.get("type")
                 doc_path = doc.get("path", "")
                 
-                # Filter for markdown files only
-                if not doc_path.endswith(".md"):
+                # Filter for markdown files only (accept files without extension as note)
+                if not self._is_markdown_note(doc_path):
                     continue
                     
                 try:
@@ -176,7 +178,7 @@ class CouchDBClient:
                 doc_path = doc.get("path", "")
                 if (doc_type in ["notes", "newnote", "plain"] and 
                     not doc.get("deleted", False) and 
-                    doc_path.endswith(".md")):
+                    self._is_markdown_note(doc_path)):
                     try:
                         if doc_type == "notes":
                             note = NoteEntry(**doc)
@@ -519,96 +521,105 @@ class CouchDBClient:
             return await self._search_notes_fallback(query, limit)
     
     async def _search_notes_database(self, query: str, limit: int) -> List[EntryDoc]:
-        """Search notes using CouchDB's text search capabilities."""
+        """Optimised search using Mango `$text` operator if a text index exists.
+        Falls back to the previous (slower) implementation when `$text` is unavailable.
+        """
         try:
-            # Use CouchDB _find with text search
             url = self._get_db_url("_find")
-            
-            # Build text search query (simplified to avoid regex issues)
-            search_query = {
+
+            # Attempt fast text search via Mango `$text`.
+            text_query = {
                 "selector": {
                     "$and": [
-                        {
-                            "type": {
-                                "$in": ["notes", "newnote", "plain"]
-                            }
-                        },
-                        {
-                            "$or": [
-                                {"deleted": {"$exists": False}},
-                                {"deleted": False}
-                            ]
-                        }
+                        {"type": {"$in": ["notes", "newnote", "plain"]}},
+                        {"$text": query}
                     ]
                 },
-                "limit": limit * 3,  # Get more docs since we'll filter
-                "sort": [{"mtime": "desc"}]
+                "limit": limit,
+                # Only pull lightweight fields; we will fetch full content lazily.
+                "fields": ["_id", "path", "type", "ctime", "mtime", "size", "children"]
             }
-            
-            response = await self.client.post(url, json=search_query)
+
+            response = await self.client.post(url, json=text_query)
+
+            # If `$text` search is unavailable (status 400) or any non-200 status, fall back.
             if response.status_code != 200:
-                return []
-            
-            data = response.json()
-            notes = []
-            query_lower = query.lower()
-            
-            for doc in data.get("docs", []):
-                doc_type = doc.get("type")
-                doc_path = doc.get("path", "")
-                doc_data = doc.get("data", "")
-                
-                # Filter for markdown files only
-                if not doc_path.endswith(".md"):
+                return await self._search_notes_fallback(query, limit)
+
+            # We only have metadata at this point; fetch full doc (still limited) for processing.
+            docs_meta = response.json().get("docs", [])
+            full_docs: List[EntryDoc] = []
+
+            # Fetch full documents concurrently.
+            async with anyio.create_task_group() as tg:
+                contents: List[dict] = []
+
+                async def _pull(docid: str):
+                    doc = await self.get_document(docid)
+                    if doc:
+                        contents.append(doc)
+
+                for meta in docs_meta:
+                    tg.start_soon(_pull, meta["_id"])
+
+            for doc in contents:
+                try:
+                    doc_type = doc.get("type")
+                    if doc_type == "notes":
+                        full_docs.append(NoteEntry(**doc))
+                    elif doc_type == "newnote":
+                        full_docs.append(NewEntry(**doc))
+                    elif doc_type == "plain":
+                        full_docs.append(PlainEntry(**doc))
+                except Exception:
                     continue
-                
-                # Simple text search in path and data
-                if (query_lower in doc_path.lower() or 
-                    query_lower in doc_data.lower()):
-                    try:
-                        if doc_type == "notes":
-                            note = NoteEntry(**doc)
-                        elif doc_type == "newnote":
-                            note = NewEntry(**doc)
-                        elif doc_type == "plain":
-                            note = PlainEntry(**doc)
-                        else:
-                            continue
-                        notes.append(note)
-                        
-                        # Stop when we have enough notes
-                        if len(notes) >= limit:
-                            break
-                    except Exception:
-                        continue
-            
-            return notes
-            
+
+            return full_docs[:limit]
+
         except Exception:
-            return []
+            # Fallback: previous slower implementation.
+            return await self._search_notes_fallback(query, limit)
     
     async def _search_notes_fallback(self, query: str, limit: int) -> List[Tuple[ObsidianNote, float]]:
         """Fallback client-side search when database search is not available."""
         try:
-            # Get a reasonable number of recent notes for client-side search
-            notes = await self.list_notes(limit=min(200, limit * 4))
-            results = []
-            
+            # We may need to scan multiple pages if the vault is large and the note is old.
+            page_size = 200  # sensible chunk
+            skip = 0
+            gathered: List[Tuple[ObsidianNote, float]] = []
             query_lower = query.lower()
-            
-            for entry in notes:
-                processed_note = await self.process_note(entry)
-                if not processed_note:
-                    continue
-                
-                score = self._calculate_search_score(processed_note, query_lower)
-                if score > 0:
-                    results.append((processed_note, score))
-            
-            # Sort by score and limit results
-            results.sort(key=lambda x: x[1], reverse=True)
-            return results[:limit]
-            
+
+            # hard stop after scanning 5000 docs to avoid runaway latency
+            scanned_docs = 0
+            max_scan = 5000
+
+            while len(gathered) < limit and scanned_docs < max_scan:
+                batch = await self.list_notes(limit=page_size, skip=skip)
+                if not batch:
+                    break  # no more docs
+
+                for entry in batch:
+                    processed_note = await self.process_note(entry)
+                    if not processed_note:
+                        continue
+
+                    score = self._calculate_search_score(processed_note, query_lower)
+                    if score > 0:
+                        gathered.append((processed_note, score))
+                        if len(gathered) >= limit:
+                            break
+
+                scanned_docs += len(batch)
+                skip += len(batch)
+
+                if scanned_docs % 1000 == 0:
+                    logger.debug("_search_notes_fallback scanned %s docs (matches=%s) so far for query '%s'", scanned_docs, len(gathered), query)
+
+            # sort gathered by score desc
+            gathered.sort(key=lambda x: x[1], reverse=True)
+            logger.debug("_search_notes_fallback finished query '%s' scanned %s docs total, matches=%s", query, scanned_docs, len(gathered))
+            return gathered[:limit]
+
         except Exception:
             return []
     
@@ -649,3 +660,7 @@ class CouchDBClient:
         except Exception as e:
             logger.error(f"Error getting recent note: {e}")
             return None 
+
+    def _is_markdown_note(self, path: str) -> bool:
+        """Return True if the path looks like a markdown note ('.md' or no extension)."""
+        return path.endswith(".md") or "." not in path

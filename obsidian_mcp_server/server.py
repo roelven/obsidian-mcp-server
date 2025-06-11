@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, unquote
 
@@ -17,8 +18,11 @@ from .rate_limiter import RateLimiter, RateLimitExceeded
 from .types import ObsidianNote
 
 # Configure logging
+log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
+
 logging.basicConfig(
-    level=logging.WARNING,  # Changed from DEBUG to WARNING
+    level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler() # Ensure logs go to stdout/stderr for Docker
@@ -54,7 +58,7 @@ class ObsidianMCPServer:
             
             try:
                 # Limit to a very small number to prevent overwhelming AI clients
-                # AI clients should use search_notes or browse_notes tools instead
+                # AI clients should use the find_notes tool for comprehensive access instead
                 entries = await self.couchdb_client.list_notes(limit=10, sort_by="mtime")
                 resources = []
                 
@@ -108,57 +112,50 @@ class ObsidianMCPServer:
         @self.app.list_tools()
         async def list_tools() -> List[types.Tool]:
             """List available tools."""
-            logger.info("Tools requested - returning search_notes, browse_notes, and get_recent_note")
+            logger.info("Tools requested - returning find_notes and summarise_note")
             return [
                 types.Tool(
-                    name="search_notes",
-                    description="Search through Obsidian notes by title, content, or tags. Leave query empty to browse recent notes. Automatically includes full content for small result sets.",
+                    name="find_notes",
+                    description=(
+                        "Search or browse Obsidian notes with flexible filters. "
+                        "If `query` is omitted the tool returns recent notes. "
+                        "Automatically includes full note content when <=3 results unless `include_content` is false. "
+                        "Set `exists_only` to true to perform a lightweight existence check that returns only a boolean and match count."
+                    ),
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query to find relevant notes. Leave empty to browse recent notes.",
+                                "description": "Search term. Leave empty to fetch recent notes.",
                                 "default": ""
                             },
-                            "limit": {
+                            "since_days": {
                                 "type": "integer",
-                                "description": "Maximum number of results to return (default: 10, max: 50)",
-                                "default": 10,
-                                "minimum": 1,
-                                "maximum": 50
+                                "description": "Only include notes modified in the last N days.",
+                                "minimum": 1
                             },
-                            "include_content": {
-                                "type": "boolean",
-                                "description": "Whether to include full note content in results. Auto-enabled for small result sets (≤3 notes).",
-                                "default": False
-                            }
-                        },
-                        "required": []
-                    }
-                ),
-                types.Tool(
-                    name="browse_notes",
-                    description="Browse recent Obsidian notes without searching. Automatically includes full content for small result sets to improve user experience.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
                             "limit": {
                                 "type": "integer",
-                                "description": "Maximum number of notes to return (default: 20, max: 50)",
-                                "default": 20,
+                                "description": "Maximum number of results to return (default 10, max 50).",
+                                "default": 10,
                                 "minimum": 1,
                                 "maximum": 50
                             },
                             "sort_by": {
                                 "type": "string",
-                                "description": "Sort order for notes",
+                                "description": "Sort order for notes.",
                                 "enum": ["mtime", "ctime", "path"],
                                 "default": "mtime"
                             },
                             "include_content": {
                                 "type": "boolean",
-                                "description": "Whether to include full note content in results. Auto-enabled for small result sets (≤3 notes).",
+                                "description": "Include full note content in each result (auto-enabled for <=3 results).",
+                                "default": False
+                            },
+                            "exists_only": {
+                                "type": "boolean",
+                                "description": "Return only {exists:boolean, match_count:number} instead of full results.",
                                 "default": False
                             }
                         },
@@ -166,19 +163,24 @@ class ObsidianMCPServer:
                     }
                 ),
                 types.Tool(
-                    name="get_recent_note",
-                    description="Get the most recent note with full content. Optimized for 'show me the latest note' queries.",
+                    name="summarise_note",
+                    description="Generate a short summary (≈ N words) of a single note identified by its MCP URI.",
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "sort_by": {
+                            "uri": {
                                 "type": "string",
-                                "description": "How to determine 'most recent'",
-                                "enum": ["mtime", "ctime"],
-                                "default": "mtime"
+                                "description": "MCP URI of the note to summarise."
+                            },
+                            "max_words": {
+                                "type": "integer",
+                                "description": "Maximum words in the summary (default 300).",
+                                "default": 300,
+                                "minimum": 50,
+                                "maximum": 1000
                             }
                         },
-                        "required": []
+                        "required": ["uri"]
                     }
                 )
             ]
@@ -194,217 +196,115 @@ class ObsidianMCPServer:
                     text="Rate limit exceeded. Please wait before making more requests."
                 )]
             
-            if name == "search_notes":
-                logger.info(f"search_notes tool called with arguments: {arguments}")
+            if name == "find_notes":
+                logger.info(f"find_notes tool called with arguments: {arguments}")
                 try:
+                    # Extract arguments with defaults
                     query = arguments.get("query", "").strip()
-                    limit = min(arguments.get("limit", 10), 50)  # Cap at 50
-                    include_content = arguments.get("include_content", False)
-                    
-                    if not query:
-                        # If no query, browse recent notes
-                        entries = await self.couchdb_client.list_notes(limit=limit, sort_by="mtime")
-                        notes = []
+                    since_days = arguments.get("since_days")
+                    limit = min(arguments.get("limit", 10), 50)
+                    sort_by = arguments.get("sort_by", "mtime")
+                    include_content_flag = arguments.get("include_content", False)
+                    exists_only = arguments.get("exists_only", False)
+
+                    # Helper to post-filter by since_days
+                    def _filter_by_date(notes_list):
+                        if not since_days:
+                            return notes_list
+                        try:
+                            import time
+                            threshold_ms = int(time.time() * 1000) - int(since_days) * 86400000
+                        except Exception:
+                            return notes_list
+                        return [n for n in notes_list if n.modified_at >= threshold_ms]
+
+                    notes: List[ObsidianNote] = []
+
+                    if query:
+                        # Use search
+                        results = await self.couchdb_client.search_notes(query, limit * 2)
+                        notes_only = [n for (n, _score) in results]
+                        notes = _filter_by_date(notes_only)[:limit]
+                    else:
+                        # Browse recent
+                        entries = await self.couchdb_client.list_notes(limit=limit * 2, sort_by=sort_by)
                         for entry in entries:
                             note = await self.couchdb_client.process_note(entry)
                             if note:
                                 notes.append(note)
-                        
-                        if not notes:
-                            return [types.TextContent(
-                                type="text",
-                                text="No notes found in your vault"
-                            )]
-                        
-                        # Auto-enable content inclusion for small result sets
-                        should_include_content = include_content or len(notes) <= 3
-                        
-                        # Format browse results
-                        response_lines = [f"Recent {len(notes)} notes from your vault:\n"]
-                        
-                        for i, note in enumerate(notes):
-                            response_lines.append(f"**{note.title}**")
-                            response_lines.append(f"Path: {note.path}")
-                            if note.tags:
-                                response_lines.append(f"Tags: {', '.join(note.tags)}")
-                            response_lines.append(f"URI: {self._create_note_uri(note.path)}")
-                            
-                            # Include content for small result sets or when requested
-                            if should_include_content:
-                                response_lines.append("\n---\n")  # Separator
-                                if note.content:
-                                    # Truncate very long content for readability
-                                    content = note.content
-                                    if len(content) > 3000:
-                                        content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
-                                    response_lines.append(content)
-                                else:
-                                    response_lines.append("[Content not available or note is empty]")
-                            
-                            response_lines.append("")  # Empty line
-                        
-                        return [types.TextContent(
-                            type="text",
-                            text="\n".join(response_lines)
-                        )]
-                    else:
-                        # Search with query
-                        results = await self.couchdb_client.search_notes(query, limit)
-                        
-                        if not results:
-                            return [types.TextContent(
-                                type="text",
-                                text=f"No notes found matching '{query}'"
-                            )]
-                        
-                        # Auto-enable content inclusion for small result sets
-                        should_include_content = include_content or len(results) <= 3
-                        
-                        # Format search results
-                        response_lines = [f"Found {len(results)} notes matching '{query}':\n"]
-                        
-                        for note, score in results:
-                            response_lines.append(f"**{note.title}**")
-                            response_lines.append(f"Path: {note.path}")
-                            response_lines.append(f"Score: {score:.1f}")
-                            if note.tags:
-                                response_lines.append(f"Tags: {', '.join(note.tags)}")
-                            response_lines.append(f"URI: {self._create_note_uri(note.path)}")
-                            
-                            # Include content for small result sets or when requested
-                            if should_include_content:
-                                response_lines.append("\n---\n")  # Separator
-                                if note.content:
-                                    # Truncate very long content for readability
-                                    content = note.content
-                                    if len(content) > 3000:
-                                        content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
-                                    response_lines.append(content)
-                                else:
-                                    response_lines.append("[Content not available or note is empty]")
-                            
-                            response_lines.append("")  # Empty line
-                        
-                        return [types.TextContent(
-                            type="text",
-                            text="\n".join(response_lines)
-                        )]
-                    
+                        notes = _filter_by_date(notes)[:limit]
+
+                    match_count = len(notes)
+                    if exists_only:
+                        payload = {"exists": match_count > 0, "match_count": match_count}
+                        import json
+                        return [types.TextContent(type="text", text=json.dumps(payload))]
+
+                    # Determine if we should include content automatically
+                    should_include_content = include_content_flag or match_count <= 3
+
+                    # Build response list
+                    response_items: List[dict] = []
+                    for n in notes:
+                        item = {
+                            "uri": self._create_note_uri(n.path),
+                            "title": n.title,
+                            "path": n.path,
+                            "mtime": n.modified_at,
+                            "ctime": n.created_at,
+                            "tags": n.tags,
+                        }
+                        if should_include_content and n.content:
+                            content_val = n.content
+                            if len(content_val) > 3000:
+                                content_val = content_val[:3000] + "\n\n[Content truncated - use resources/read for full content]"
+                            item["content"] = content_val
+                        response_items.append(item)
+
+                    import json
+                    return [types.TextContent(type="text", text=json.dumps(response_items))]
+
                 except Exception as e:
-                    logger.error(f"Error in search_notes tool: {e}")
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Error searching notes: {e}"
-                    )]
-            elif name == "browse_notes":
-                logger.info(f"browse_notes tool called with arguments: {arguments}")
+                    logger.error(f"Error in find_notes tool: {e}")
+                    return [types.TextContent(type="text", text=f"Error executing find_notes: {e}")]
+
+            elif name == "summarise_note":
+                logger.info(f"summarise_note tool called with arguments: {arguments}")
                 try:
-                    limit = min(arguments.get("limit", 20), 50)  # Cap at 50
-                    sort_by = arguments.get("sort_by", "mtime")
-                    include_content = arguments.get("include_content", False)
-                    
-                    # Get recent notes
-                    entries = await self.couchdb_client.list_notes(limit=limit, sort_by=sort_by)
-                    notes = []
-                    for entry in entries:
-                        note = await self.couchdb_client.process_note(entry)
-                        if note:
-                            notes.append(note)
-                    
-                    if not notes:
-                        return [types.TextContent(
-                            type="text",
-                            text="No notes found in your vault"
-                        )]
-                    
-                    # Auto-enable content inclusion for small result sets
-                    should_include_content = include_content or len(notes) <= 3
-                    
-                    # Format browse results
-                    sort_desc = {"mtime": "recently modified", "ctime": "recently created", "path": "alphabetical"}
-                    response_lines = [f"Browsing {len(notes)} {sort_desc.get(sort_by, 'recent')} notes:\n"]
-                    
-                    for note in notes:
-                        response_lines.append(f"**{note.title}**")
-                        response_lines.append(f"Path: {note.path}")
-                        if note.tags:
-                            response_lines.append(f"Tags: {', '.join(note.tags)}")
-                        response_lines.append(f"URI: {self._create_note_uri(note.path)}")
-                        
-                        # Include content for small result sets or when requested
-                        if should_include_content:
-                            response_lines.append("\n---\n")  # Separator
-                            if note.content:
-                                # Truncate very long content for readability
-                                content = note.content
-                                if len(content) > 3000:
-                                    content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
-                                response_lines.append(content)
-                            else:
-                                response_lines.append("[Content not available or note is empty]")
-                        
-                        response_lines.append("")  # Empty line
-                    
-                    return [types.TextContent(
-                        type="text",
-                        text="\n".join(response_lines)
-                    )]
-                    
+                    uri = arguments.get("uri")
+                    if not uri:
+                        raise ValueError("'uri' is required")
+                    max_words = int(arguments.get("max_words", 300))
+
+                    note_path = self._extract_path_from_uri(uri)
+                    if not note_path:
+                        raise ValueError(f"Invalid note URI: {uri}")
+
+                    content = await self.couchdb_client.get_note_content(note_path)
+                    if content is None:
+                        raise ValueError(f"Note not found: {note_path}")
+
+                    # Naive summary: first max_words words
+                    words = content.split()
+                    summary_words = words[:max_words]
+                    summary = " ".join(summary_words)
+                    if len(words) > max_words:
+                        summary += " …"
+
+                    payload = {
+                        "uri": uri,
+                        "summary": summary,
+                        "word_count": len(summary_words)
+                    }
+                    import json
+                    return [types.TextContent(type="text", text=json.dumps(payload))]
+
                 except Exception as e:
-                    logger.error(f"Error in browse_notes tool: {e}")
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Error browsing notes: {e}"
-                    )]
-            elif name == "get_recent_note":
-                logger.info(f"get_recent_note tool called with arguments: {arguments}")
-                try:
-                    sort_by = arguments.get("sort_by", "mtime")
-                    
-                    # Get the most recent note
-                    note = await self.couchdb_client.get_recent_note(sort_by)
-                    if not note:
-                        return [types.TextContent(
-                            type="text",
-                            text="No recent note found in your vault"
-                        )]
-                    
-                    # Format recent note
-                    response_lines = [f"Most recent note in your vault:\n"]
-                    response_lines.append(f"**{note.title}**")
-                    response_lines.append(f"Path: {note.path}")
-                    if note.tags:
-                        response_lines.append(f"Tags: {', '.join(note.tags)}")
-                    response_lines.append(f"URI: {self._create_note_uri(note.path)}")
-                    
-                    # Include content for small result sets or when requested
-                    if note.content:
-                        # Truncate very long content for readability
-                        content = note.content
-                        if len(content) > 3000:
-                            content = content[:3000] + "\n\n[Content truncated - use resources/read for full content]"
-                        response_lines.append("\n---\n")  # Separator
-                        response_lines.append(content)
-                    else:
-                        response_lines.append("[Content not available or note is empty]")
-                    
-                    response_lines.append("")  # Empty line
-                    
-                    return [types.TextContent(
-                        type="text",
-                        text="\n".join(response_lines)
-                    )]
-                except Exception as e:
-                    logger.error(f"Error in get_recent_note tool: {e}")
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Error getting recent note: {e}"
-                    )]
+                    logger.error(f"Error in summarise_note tool: {e}")
+                    return [types.TextContent(type="text", text=f"Error executing summarise_note: {e}")]
+
             else:
-                return [types.TextContent(
-                    type="text",
-                    text=f"Unknown tool: {name}"
-                )]
+                return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
     
     def _create_note_uri(self, note_path: str) -> str:
         """Create MCP URI for a note."""
