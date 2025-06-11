@@ -14,6 +14,23 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 - **Docker support** for easy deployment
 - **Configurable** via environment variables
 
+> ℹ️ **Search & encrypted vaults**  
+> The server first attempts a CouchDB `$text` query (for deployments that have the
+> optional Nouveau/Lucene service enabled). If the database is **encrypted** the
+> index contains only ciphertext, so this step is useless; the server
+> automatically falls back to its built-in, in-process search that decrypts each
+> candidate note on the fly. You don't need to disable anything manually—just
+> be aware that enabling Nouveau will not improve search speed for encrypted
+> vaults.
+
+To silence the Nouveau probe entirely you can set the environment variable
+
+```bash
+USE_NOUVEAU=false  # skip the initial $text attempt
+```
+
+leaving everything else unchanged.
+
 ## Architecture
 
 ```
