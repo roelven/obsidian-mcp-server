@@ -153,6 +153,23 @@ class ObsidianMCPServer:
                                 "description": "Include full note content in each result (auto-enabled for <=3 results).",
                                 "default": False
                             },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Number of matching notes to skip (for paging).",
+                                "default": 0,
+                                "minimum": 0
+                            },
+                            "sort_order": {
+                                "type": "string",
+                                "description": "Sort direction (\"desc\" = newest first, \"asc\" = oldest first). Applies to the \"sort_by\" field.",
+                                "enum": ["desc", "asc"],
+                                "default": "desc"
+                            },
+                            "count_only": {
+                                "type": "boolean",
+                                "description": "Return only {match_count:number} without the actual note list.",
+                                "default": False
+                            },
                             "exists_only": {
                                 "type": "boolean",
                                 "description": "Return only {exists:boolean, match_count:number} instead of full results.",
@@ -205,6 +222,9 @@ class ObsidianMCPServer:
                     limit = min(arguments.get("limit", 10), 50)
                     sort_by = arguments.get("sort_by", "mtime")
                     include_content_flag = arguments.get("include_content", False)
+                    offset = max(int(arguments.get("offset", 0)), 0)
+                    sort_order = arguments.get("sort_order", "desc")
+                    count_only = arguments.get("count_only", False)
                     exists_only = arguments.get("exists_only", False)
 
                     # Helper to post-filter by since_days
@@ -218,16 +238,27 @@ class ObsidianMCPServer:
                             return notes_list
                         return [n for n in notes_list if n.modified_at >= threshold_ms]
 
+                    # Handle fast count-only path first
+                    if count_only:
+                        match_count = await self.couchdb_client.count_notes(query=query, since_days=since_days)
+                        import json
+                        return [types.TextContent(type="text", text=json.dumps({"match_count": match_count}))]
+
                     notes: List[ObsidianNote] = []
 
                     if query:
-                        # Use search
-                        results = await self.couchdb_client.search_notes(query, limit * 2)
+                        # Use search – fetch extra to account for offset
+                        results = await self.couchdb_client.search_notes(query, limit=offset + limit * 2)
                         notes_only = [n for (n, _score) in results]
-                        notes = _filter_by_date(notes_only)[:limit]
+                        notes = _filter_by_date(notes_only)[offset: offset + limit]
                     else:
-                        # Browse recent
-                        entries = await self.couchdb_client.list_notes(limit=limit * 2, sort_by=sort_by)
+                        # Browse recent / paginate
+                        entries = await self.couchdb_client.list_notes(
+                            limit=limit * 2,
+                            skip=offset,
+                            sort_by=sort_by,
+                            order=sort_order,
+                        )
                         for entry in entries:
                             note = await self.couchdb_client.process_note(entry)
                             if note:

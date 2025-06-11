@@ -71,7 +71,7 @@ class CouchDBClient:
         except Exception:
             return None
     
-    async def list_notes(self, limit: int = 100, skip: int = 0, sort_by: str = "mtime") -> List[EntryDoc]:
+    async def list_notes(self, limit: int = 100, skip: int = 0, sort_by: str = "mtime", order: str = "desc") -> List[EntryDoc]:
         """List note documents from CouchDB using efficient database queries."""
         try:
             # Use CouchDB _find endpoint for efficient querying
@@ -101,7 +101,7 @@ class CouchDBClient:
                 "limit": limit * 3,  # Get more docs since we'll filter for .md files
                 "skip": skip,
                 "sort": [
-                    {sort_by: "desc"}
+                    {sort_by: order}
                 ],
             }
             
@@ -109,7 +109,7 @@ class CouchDBClient:
             if response.status_code != 200:
                 # Fallback to _all_docs if _find is not available
                 # print(f"DEBUG: _find failed with status {response.status_code}, falling back to _all_docs")
-                return await self._list_notes_fallback(limit, skip)
+                return await self._list_notes_fallback(limit, skip, order)
             
             data = response.json()
             notes = []
@@ -143,12 +143,16 @@ class CouchDBClient:
                     # Skip malformed documents
                     continue
             
+            # For ascending order in fallback where we relied on _all_docs (which always returns id asc)
+            if order == "asc":
+                notes.reverse()
+
             return notes
         except Exception:
             # Fallback to original method
-            return await self._list_notes_fallback(limit, skip)
+            return await self._list_notes_fallback(limit, skip, order)
     
-    async def _list_notes_fallback(self, limit: int, skip: int) -> List[EntryDoc]:
+    async def _list_notes_fallback(self, limit: int, skip: int, order: str = "desc") -> List[EntryDoc]:
         """Fallback method using _all_docs when _find is not available."""
         try:
             url = self._get_db_url("_all_docs")
@@ -196,6 +200,9 @@ class CouchDBClient:
                     except Exception:
                         continue
             
+            # For ascending order in fallback where we relied on _all_docs (which always returns id asc)
+            if order == "asc":
+                notes.reverse()
             return notes
         except Exception:
             return []
@@ -489,11 +496,11 @@ class CouchDBClient:
             # print(f"Error processing note {entry.path if hasattr(entry, 'path') else 'unknown'}: {e}")
             return None
     
-    async def search_notes(self, query: str, limit: int = 50) -> List[Tuple[ObsidianNote, float]]:
+    async def search_notes(self, query: str, limit: int = 50, offset: int = 0) -> List[Tuple[ObsidianNote, float]]:
         """Search notes using database-level querying for efficiency."""
         try:
             # First try database-level text search
-            db_results = await self._search_notes_database(query, limit * 2)
+            db_results = await self._search_notes_database(query, limit=limit, skip=offset)
             
             if db_results:
                 # Process and score the database results
@@ -520,7 +527,7 @@ class CouchDBClient:
             # Fallback to client-side search
             return await self._search_notes_fallback(query, limit)
     
-    async def _search_notes_database(self, query: str, limit: int) -> List[EntryDoc]:
+    async def _search_notes_database(self, query: str, limit: int, skip: int = 0) -> List[EntryDoc]:
         """Optimised search using Mango `$text` operator if a text index exists.
         Falls back to the previous (slower) implementation when `$text` is unavailable.
         """
@@ -536,6 +543,7 @@ class CouchDBClient:
                     ]
                 },
                 "limit": limit,
+                "skip": skip,
                 # Only pull lightweight fields; we will fetch full content lazily.
                 "fields": ["_id", "path", "type", "ctime", "mtime", "size", "children"]
             }
@@ -580,12 +588,11 @@ class CouchDBClient:
             # Fallback: previous slower implementation.
             return await self._search_notes_fallback(query, limit)
     
-    async def _search_notes_fallback(self, query: str, limit: int) -> List[Tuple[ObsidianNote, float]]:
+    async def _search_notes_fallback(self, query: str, limit: int, skip: int = 0) -> List[Tuple[ObsidianNote, float]]:
         """Fallback client-side search when database search is not available."""
         try:
             # We may need to scan multiple pages if the vault is large and the note is old.
             page_size = 200  # sensible chunk
-            skip = 0
             gathered: List[Tuple[ObsidianNote, float]] = []
             query_lower = query.lower()
 
@@ -664,3 +671,46 @@ class CouchDBClient:
     def _is_markdown_note(self, path: str) -> bool:
         """Return True if the path looks like a markdown note ('.md' or no extension)."""
         return path.endswith(".md") or "." not in path
+
+    # ------------------------------------------------------------------
+    # Counting helper
+    # ------------------------------------------------------------------
+
+    async def count_notes(self, query: str = "", since_days: Optional[int] = None) -> int:
+        """Return the total number of notes matching optional query/since_days filters.
+
+        For now we obtain the count by paging through the vault in Mango _find calls
+        with a fairly large page size (500).  CouchDB 3.x doesn't provide a cheap
+        aggregate count for arbitrary selectors, so this pragmatic approach keeps
+        memory usage bounded while remaining reasonably fast.
+        """
+
+        page_size = 500
+        total = 0
+        offset = 0
+
+        while True:
+            if query:
+                # Use existing search – we don't need scores/content, so ask for
+                # processed notes only (content still parsed but acceptable for
+                # vault-wide stats which are infrequent).
+                results = await self.search_notes(query, limit=page_size, offset=offset)
+                batch = [n for (n, _s) in results]
+            else:
+                batch = await self.list_notes(limit=page_size, skip=offset)
+
+            # Filter by since_days if requested
+            if since_days:
+                import time
+                threshold_ms = int(time.time() * 1000) - int(since_days) * 86400000
+                batch = [n for n in batch if n.mtime >= threshold_ms]
+
+            batch_len = len(batch)
+            total += batch_len
+
+            if batch_len < page_size:
+                break
+
+            offset += page_size
+
+        return total
