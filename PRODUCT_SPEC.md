@@ -152,7 +152,8 @@ The server implements the Model Context Protocol (MCP) version **2025-03-26** us
 *   **Encoding:** UTF-8.
 *   **Supported Transports:** 
     *   **stdio**: Standard input/output for direct subprocess communication
-    *   **SSE**: Server-Sent Events over HTTP for web-based clients
+    *   **HTTP**: Single-endpoint GET/POST model with in-memory session queues
+    *   **SSE**: Server-Sent Events over HTTP for web-based clients (deprecated)
 *   Messages (requests, responses, notifications) adhere to JSON-RPC 2.0 and MCP 2025-03-26 specifications.
 
 **2.2. Authentication & Authorization**
@@ -270,7 +271,13 @@ On rejection the client **SHOULD** retry with a supported version (typically the
 
 **2.6. Error Handling (JSON-RPC)**
 *   Uses standard JSON-RPC error response structure.
-*   MCP-specific error codes and server-specific errors for CouchDB connectivity, note processing, etc.
+*   Centralized error handling via `errors.py` with standard error codes:
+    *   `-32001`: Protocol version mismatch
+    *   `-32002`: Resource not found
+    *   `-32003`: Rate limit exceeded
+    *   `-32099`: Internal server error
+*   All handlers use structured error responses with proper error codes and messages.
+*   Rate limiting and session management errors are properly handled with appropriate status codes.
 
 ### 3. CouchDB Interaction Details
 
@@ -311,11 +318,12 @@ On rejection the client **SHOULD** retry with a supported version (typically the
 ### 6. Technology Stack
 
 *   **Backend Language/Framework:** Python with the **MCP Python SDK** (Model Context Protocol official SDK) for protocol implementation and server lifecycle management.
-*   **MCP Transport Layer:** Built-in MCP transports (stdio, SSE) provided by the SDK.
-*   **CouchDB Client Library (Python):** \`httpx\` for direct HTTP API calls to CouchDB with async support.
-*   **Markdown Parsing Library (Python):** \`python-frontmatter\` for parsing YAML frontmatter and extracting metadata.
+*   **MCP Transport Layer:** Built-in MCP transports (stdio, HTTP) provided by the SDK.
+*   **Async Runtime:** asyncio for all asynchronous operations.
+*   **CouchDB Client Library (Python):** `httpx` for direct HTTP API calls to CouchDB with async support.
+*   **Markdown Parsing Library (Python):** `python-frontmatter` for parsing YAML frontmatter and extracting metadata.
 *   **Configuration Management:** Pydantic for loading/validating environment variables and settings.
-*   **Encryption Support:** \`octagonal-wheels\` compatible decryption for encrypted vault content (which is also used for [obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync)).
+*   **Encryption Support:** `octagonal-wheels` compatible decryption for encrypted vault content (which is also used for [obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync)).
 *   **Rate Limiting:** Custom rate limiter implementation to prevent API abuse.
 
 ### 6.1. Recent Improvements (v0.1.0)

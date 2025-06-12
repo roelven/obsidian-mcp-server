@@ -16,6 +16,8 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 - **Handles encrypted vaults** (if `VAULT_PASSPHRASE` is provided)
 - **Docker support** for easy deployment
 - **Configurable** via environment variables
+- **Modern HTTP transport** with proper session management and rate limiting
+- **Structured error handling** with standard JSON-RPC error codes
 
 ## Architecture
 
@@ -84,7 +86,10 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
    # For stdio transport (direct MCP client connection)
    obsidian-mcp-server --transport stdio
    
-   # For SSE transport (HTTP-based)
+   # For HTTP transport (recommended)
+   obsidian-mcp-server --transport http --port 8000
+   
+   # For SSE transport (deprecated)
    obsidian-mcp-server --transport sse --port 8000
    ```
 
@@ -381,3 +386,16 @@ MIT License - see LICENSE file for details.
 - [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [Claude Desktop](https://claude.ai/desktop)
+
+## Error Handling
+
+The server uses structured JSON-RPC error responses with standard error codes:
+
+| Error Code | Meaning | Condition |
+|-----------:|---------|-----------|
+| `-32001` | Protocol version mismatch | Client requested an unsupported `protocolVersion` |
+| `-32002` | Resource not found | Requested note does not exist |
+| `-32003` | Rate limit exceeded | Too many requests in a time window |
+| `-32099` | Internal server error | Unexpected server-side error |
+
+All errors include a descriptive message and may include additional data in the `data` field.
