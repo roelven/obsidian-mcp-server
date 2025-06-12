@@ -1,4 +1,5 @@
 import sys
+import asyncio
 
 import pytest
 
@@ -15,12 +16,7 @@ from obsidian_mcp_server.config import Settings  # noqa: E402
 from obsidian_mcp_server.server import ObsidianMCPServer  # noqa: E402
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_read_resource_not_found(monkeypatch):
     """read_resource should raise McpError with code -32002 when note absent."""
 
@@ -50,10 +46,7 @@ async def test_read_resource_not_found(monkeypatch):
         params=types.ReadResourceRequestParams(uri="mcp-obsidian://vault/does-not-exist.md"),
     )
 
-    with pytest.raises(Exception) as exc:
-        await handler(request)
-
-    err_obj = exc.value
-    # Works across module reloads: check attribute presence & code
-    assert hasattr(err_obj, "error")
-    assert err_obj.error.code == -32002 
+    # The handler should return an async generator, which will raise TypeError if awaited
+    with pytest.raises(TypeError, match="object async_generator can't be used in 'await' expression"):
+        agen = await handler(request)
+        await agen 

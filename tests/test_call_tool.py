@@ -21,12 +21,7 @@ import mcp.types as types  # noqa: E402
 from obsidian_mcp_server.config import Settings  # noqa: E402
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_call_tool_find_notes(monkeypatch):
     """`find_notes` should return CallToolResult with isError=False."""
 
@@ -60,7 +55,7 @@ async def test_call_tool_find_notes(monkeypatch):
     assert result.root.isError is False
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_call_tool_unknown(monkeypatch):
     """Unknown tool should yield isError=True."""
 

@@ -11,10 +11,18 @@ import textwrap
 import pytest
 
 
+@pytest.mark.asyncio
 async def test_decryption():
     """Test decryption with the actual vault."""
     # Load settings from environment
-    settings = Settings()
+    settings = Settings(
+        couchdb_base_url="http://localhost:5984",
+        couchdb_database_name="test_db",
+        couchdb_user="test_user",
+        couchdb_password="test_pass",
+        api_key="test_key",
+        vault_passphrase="test_passphrase"
+    )
     
     print(f"Testing connection to: {settings.couchdb_base_url}")
     print(f"Database: {settings.couchdb_database_name}")
