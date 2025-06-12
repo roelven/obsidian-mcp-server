@@ -8,6 +8,7 @@ import os
 from obsidian_mcp_server.config import Settings
 from obsidian_mcp_server.couchdb_client import CouchDBClient
 import textwrap
+import pytest
 
 
 async def test_decryption():
