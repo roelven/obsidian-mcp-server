@@ -186,6 +186,32 @@ The server implements the Model Context Protocol (MCP) version **2025-03-26** us
     }
     \`\`\`
 
+**Version validation**
+
+The server enforces **strict** protocol-version negotiation:
+
+* If the client's `protocolVersion` is **not** one of the SDK's `SUPPORTED_PROTOCOL_VERSIONS`, the server **rejects** the request with a JSON-RPC error:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32001,
+    "message": "Protocol version mismatch",
+    "data": {
+      "supportedVersions": ["2025-03-26", "2024-11-05"]
+    }
+  }
+}
+```
+
+On rejection the client **SHOULD** retry with a supported version (typically the latest advertised).
+
+| Error Code | Meaning | Condition |
+|-----------:|---------|-----------|
+| `-32001` | Protocol version mismatch | Client requested an unsupported `protocolVersion` |
+
 **2.3.2. \`notifications/initialized\` (Client to Server)**
 *   **Description:** Notification sent by client after successful \`initialize\` response, indicating it's ready for normal operations.
 *   **\`params\`:** None (or empty object).

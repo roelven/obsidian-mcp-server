@@ -7,6 +7,7 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 ## Features
 
 - **Read-only access** to your Obsidian notes via MCP protocol version **2025-03-26**
+- **Strict version negotiation** – the server rejects unsupported `protocolVersion` values with JSON-RPC error **−32001** so clients can gracefully fall back.
 - **Performance-optimized** resource listing (10 recent notes) with comprehensive search tools
 - **Enhanced UX**: Automatic content inclusion for small result sets (≤3 notes) to reduce back-and-forth
 - **Seamless integration** with existing Obsidian LiveSync infrastructure
