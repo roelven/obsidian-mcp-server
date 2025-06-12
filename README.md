@@ -2,6 +2,8 @@
 
 A Model Context Protocol (MCP) server that provides AI models with access to your Obsidian notes through your existing LiveSync CouchDB setup.
 
+> **Disclaimer:** This MCP server is vibe-coded by Claude, Gemini and me. See the [Product Spec](PRODUCT_SPEC.md) for details. 
+
 ## Features
 
 - **Read-only access** to your Obsidian notes via MCP protocol version **2025-03-26**
@@ -13,23 +15,6 @@ A Model Context Protocol (MCP) server that provides AI models with access to you
 - **Handles encrypted vaults** (if `VAULT_PASSPHRASE` is provided)
 - **Docker support** for easy deployment
 - **Configurable** via environment variables
-
-> ℹ️ **Search & encrypted vaults**  
-> The server first attempts a CouchDB `$text` query (for deployments that have the
-> optional Nouveau/Lucene service enabled). If the database is **encrypted** the
-> index contains only ciphertext, so this step is useless; the server
-> automatically falls back to its built-in, in-process search that decrypts each
-> candidate note on the fly. You don't need to disable anything manually—just
-> be aware that enabling Nouveau will not improve search speed for encrypted
-> vaults.
-
-To silence the Nouveau probe entirely you can set the environment variable
-
-```bash
-USE_NOUVEAU=false  # skip the initial $text attempt
-```
-
-leaving everything else unchanged.
 
 ## Architecture
 
@@ -66,7 +51,6 @@ leaving everything else unchanged.
    COUCHDB_DATABASE_NAME=your-livesync-db-name
    COUCHDB_USER=your-username
    COUCHDB_PASSWORD=your-password
-   API_KEY=your-secure-api-key
    ```
 
 3. **Run with Docker Compose:**
@@ -92,7 +76,6 @@ leaving everything else unchanged.
    export COUCHDB_DATABASE_NAME="your-db-name"
    export COUCHDB_USER="your-username"
    export COUCHDB_PASSWORD="your-password"
-   export API_KEY="your-api-key"
    ```
 
 3. **Run the server:**
@@ -114,9 +97,8 @@ All configuration is done via environment variables:
 | `COUCHDB_DATABASE_NAME` | Yes | - | Name of your LiveSync database |
 | `COUCHDB_USER` | Yes | - | CouchDB username |
 | `COUCHDB_PASSWORD` | Yes | - | CouchDB password |
-| `API_KEY` | Yes | - | API key for future HTTP endpoint authentication |
 | `SERVER_PORT` | No | 8000 | Port for SSE transport |
-| `USE_PATH_OBFUSCATION` | No | false | Whether LiveSync uses path obfuscation |
+| `USE_PATH_OBFUSCATION` | No | false | Whether LiveSync uses path obfuscation (currently not supported) |
 | `VAULT_PASSPHRASE` | No | - | **Optional.** Passphrase for decrypting encrypted Obsidian LiveSync notes. If not set, encrypted notes will not be decrypted. |
 | `VAULT_ID` | No | default | Identifier for your vault in URIs |
 | `COUCHDB_LIST_LIMIT_FOR_PATH_SEARCH` | No | 500 | Max recent notes to scan when direct path lookup fails or path obfuscation is on. |
