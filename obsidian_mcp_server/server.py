@@ -11,6 +11,8 @@ import click
 import mcp.types as types
 from mcp.server.lowlevel import Server
 from pydantic import AnyUrl
+from mcp.shared.exceptions import McpError
+from . import errors
 
 from .config import Settings
 from .couchdb_client import CouchDBClient
@@ -63,46 +65,54 @@ def _patch_strict_version_validation() -> None:  # pragma: no cover – run at i
         """A drop-in replacement that enforces protocol-version matches."""
 
         async def _received_request(self, responder):  # type: ignore[override]
-            match responder.request.root:  # noqa: WPS513 – structural pattern
-                case _types.InitializeRequest(params=params):
-                    requested_version = params.protocolVersion
+            root = responder.request.root  # Shortcut
 
-                    # Update state: now *initializing*
-                    self._initialization_state = _session_mod.InitializationState.Initializing  # type: ignore[attr-defined]
-                    self._client_params = params  # type: ignore[assignment]
+            # ----------------------------------------------------------------
+            # Handle *initialize* regardless of exact class identity – rely on
+            # the well-known `method` attribute instead of fragile pattern
+            # matching that breaks after module reloads in tests.
+            # ----------------------------------------------------------------
 
-                    with responder:
-                        if requested_version not in SUPPORTED_PROTOCOL_VERSIONS:
-                            await responder.respond(
-                                _types.ErrorData(
-                                    code=-32001,
-                                    message="Protocol version mismatch",
-                                    data={"supportedVersions": SUPPORTED_PROTOCOL_VERSIONS},
-                                )
-                            )
-                            return
+            if getattr(root, "method", None) == "initialize":
+                params = root.params  # type: ignore[attr-defined]
+                requested_version = params.protocolVersion
 
+                # Update state: now *initializing*
+                self._initialization_state = _session_mod.InitializationState.Initializing  # type: ignore[attr-defined]
+                self._client_params = params  # type: ignore[assignment]
+
+                with responder:
+                    if requested_version not in SUPPORTED_PROTOCOL_VERSIONS:
                         await responder.respond(
-                            _types.ServerResult(
-                                _types.InitializeResult(
-                                    protocolVersion=requested_version,
-                                    capabilities=_types.ServerCapabilities.model_validate(
-                                        self._init_options.capabilities.model_dump(by_alias=True, mode="json", exclude_none=True)  # type: ignore[attr-defined]
-                                    ),
-                                    serverInfo=_types.Implementation(
-                                        name=self._init_options.server_name,  # type: ignore[attr-defined]
-                                        version=self._init_options.server_version,  # type: ignore[attr-defined]
-                                    ),
-                                    instructions=self._init_options.instructions,  # type: ignore[attr-defined]
-                                )
+                            _types.ErrorData(
+                                code=-32001,
+                                message="Protocol version mismatch",
+                                data={"supportedVersions": SUPPORTED_PROTOCOL_VERSIONS},
                             )
                         )
+                        return  # <-- do not fall through
 
-                        # Mark session as fully initialised
-                        self._initialization_state = _session_mod.InitializationState.Initialized  # type: ignore[attr-defined]
-                case _:
-                    # Delegate all other traffic to the default implementation
-                    await super()._received_request(responder)  # type: ignore[misc]
+                    await responder.respond(
+                        _types.ServerResult(
+                            _types.InitializeResult(
+                                protocolVersion=requested_version,
+                                capabilities=_types.ServerCapabilities.model_validate(
+                                    self._init_options.capabilities.model_dump(by_alias=True, mode="json", exclude_none=True)  # type: ignore[attr-defined]
+                                ),
+                                serverInfo=_types.Implementation(
+                                    name=self._init_options.server_name,  # type: ignore[attr-defined]
+                                    version=self._init_options.server_version,  # type: ignore[attr-defined]
+                                ),
+                                instructions=self._init_options.instructions,  # type: ignore[attr-defined]
+                            )
+                        )
+                    )
+
+                    self._initialization_state = _session_mod.InitializationState.Initialized  # type: ignore[attr-defined]
+                return  # handled
+
+            # Fallback to default behaviour for all other messages
+            await super()._received_request(responder)  # type: ignore[misc]
 
     # Inject our subclass into both the canonical module and the alias cached in
     # *mcp.server.lowlevel.server*
@@ -197,15 +207,18 @@ class ObsidianMCPServer:
                 # Get note content
                 content = await self.couchdb_client.get_note_content(note_path)
                 if content is None:
-                    raise ValueError(f"Note not found: {note_path}")
+                    raise McpError(errors.resource_not_found(str(uri)))
                 
                 logger.info(f"Read resource: {note_path}")
 
                 # Wrap into iterable form expected by SDK wrapper
                 return [ReadResourceContents(content=content, mime_type="text/markdown")]
+            except McpError:
+                # Already structured; just re-raise
+                raise
             except Exception as e:
                 logger.error(f"Error reading resource {uri}: {e}")
-                raise ValueError(f"Failed to read resource: {e}")
+                raise McpError(errors.internal_error(str(e)))
         
         @self.app.list_tools()
         async def list_tools() -> List[types.Tool]:
@@ -411,7 +424,7 @@ class ObsidianMCPServer:
 
                     content = await self.couchdb_client.get_note_content(note_path)
                     if content is None:
-                        raise ValueError(f"Note not found: {note_path}")
+                        raise McpError(errors.resource_not_found(str(uri)))
 
                     # Naive summary: first max_words words
                     words = content.split()
