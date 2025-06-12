@@ -195,37 +195,36 @@ for _name in ("click", "anyio"):
     _ensure_module(_name)
 
 # Very small `httpx` stub – enough for creating an `AsyncClient`
-httpx = _ensure_module("httpx")
+# httpx = _ensure_module("httpx")
 
-class _FakeResponse:  # pragma: no cover
-    def __init__(self, status_code: int = 200, json_data: Any | None = None):
-        self.status_code = status_code
-        self._json = json_data or {}
+# class _FakeResponse:  # pragma: no cover
+#     def __init__(self, status_code: int = 200, json_data: Any | None = None):
+#         self.status_code = status_code
+#         self._json = json_data or {}
 
-    def json(self):  # noqa: D401 – simple passthrough
-        return self._json
+#     def json(self):  # noqa: D401 – simple passthrough
+#         return self._json
 
+# class _FakeAsyncClient:  # pragma: no cover – only minimal async support
+#     def __init__(self, *args, **kwargs):  # noqa: D401 – store nothing
+#         pass
 
-class _FakeAsyncClient:  # pragma: no cover – only minimal async support
-    def __init__(self, *args, **kwargs):  # noqa: D401 – store nothing
-        pass
+#     async def __aenter__(self):
+#         return self
 
-    async def __aenter__(self):
-        return self
+#     async def __aexit__(self, exc_type, exc_val, exc_tb):
+#         pass
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+#     async def get(self, *_args, **_kwargs):  # noqa: D401 – always 200/empty
+#         return _FakeResponse()
 
-    async def get(self, *_args, **_kwargs):  # noqa: D401 – always 200/empty
-        return _FakeResponse()
+#     async def post(self, *_args, **_kwargs):  # noqa: D401 – always 200/empty
+#         return _FakeResponse()
 
-    async def post(self, *_args, **_kwargs):  # noqa: D401 – always 200/empty
-        return _FakeResponse()
+#     async def aclose(self):  # pragma: no cover
+#         pass
 
-    async def aclose(self):  # pragma: no cover
-        pass
-
-httpx.AsyncClient = _FakeAsyncClient  # type: ignore[attr-defined]
+# httpx.AsyncClient = _FakeAsyncClient  # type: ignore[attr-defined]
 
 # Frontmatter stub – only the attribute is imported, not used directly in the tests
 _ensure_module("frontmatter")
