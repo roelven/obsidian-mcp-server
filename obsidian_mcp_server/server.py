@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, NamedTuple, Iterable
 from urllib.parse import quote, unquote
 
 import anyio
@@ -30,6 +30,87 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Pydantic utils
+from pydantic import AnyUrl
+
+# ---------------------------------------------------------------------------
+# Monkey-patch the MCP SDK: strict protocol-version validation
+# ---------------------------------------------------------------------------
+
+# The upstream MCP ServerSession *downgrades* incompatible protocol versions to the
+# latest supported one. For compliance work we need the opposite behaviour: reject
+# unsupported versions so clients can retry with a compatible version.
+
+# We therefore create a subclass that overrides the initialize-handshake logic and
+# install it as the canonical ``ServerSession`` used throughout the SDK.
+
+
+def _patch_strict_version_validation() -> None:  # pragma: no cover – run at import
+    """Install a *strict* ServerSession implementation into the MCP SDK stack."""
+
+    import importlib
+
+    import mcp.types as _types  # noqa: WPS433 – runtime patching is intentional
+    from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS  # noqa: WPS433
+
+    # Avoid heavy *pydantic* re-exports until inside the patch body
+    from mcp.server import session as _session_mod  # type: ignore
+
+    # Dynamically define subclass to keep a tight coupling with the SDK's
+    # current public interface while minimising risk of import cycles.
+    class StrictVersionServerSession(_session_mod.ServerSession):  # type: ignore
+        """A drop-in replacement that enforces protocol-version matches."""
+
+        async def _received_request(self, responder):  # type: ignore[override]
+            match responder.request.root:  # noqa: WPS513 – structural pattern
+                case _types.InitializeRequest(params=params):
+                    requested_version = params.protocolVersion
+
+                    # Update state: now *initializing*
+                    self._initialization_state = _session_mod.InitializationState.Initializing  # type: ignore[attr-defined]
+                    self._client_params = params  # type: ignore[assignment]
+
+                    with responder:
+                        if requested_version not in SUPPORTED_PROTOCOL_VERSIONS:
+                            await responder.respond(
+                                _types.ErrorData(
+                                    code=-32001,
+                                    message="Protocol version mismatch",
+                                    data={"supportedVersions": SUPPORTED_PROTOCOL_VERSIONS},
+                                )
+                            )
+                            return
+
+                        await responder.respond(
+                            _types.ServerResult(
+                                _types.InitializeResult(
+                                    protocolVersion=requested_version,
+                                    capabilities=self._init_options.capabilities,  # type: ignore[attr-defined]
+                                    serverInfo=_types.Implementation(
+                                        name=self._init_options.server_name,  # type: ignore[attr-defined]
+                                        version=self._init_options.server_version,  # type: ignore[attr-defined]
+                                    ),
+                                    instructions=self._init_options.instructions,  # type: ignore[attr-defined]
+                                )
+                            )
+                        )
+
+                        # Mark session as fully initialised
+                        self._initialization_state = _session_mod.InitializationState.Initialized  # type: ignore[attr-defined]
+                case _:
+                    # Delegate all other traffic to the default implementation
+                    await super()._received_request(responder)  # type: ignore[misc]
+
+    # Inject our subclass into both the canonical module and the alias cached in
+    # *mcp.server.lowlevel.server*
+    _session_mod.ServerSession = StrictVersionServerSession  # type: ignore[assignment]
+    lowlevel_mod = importlib.import_module("mcp.server.lowlevel.server")
+    setattr(lowlevel_mod, "ServerSession", StrictVersionServerSession)
+
+
+# Apply patch once at import time
+_patch_strict_version_validation()
 
 
 class ObsidianMCPServer:
@@ -84,9 +165,22 @@ class ObsidianMCPServer:
                 logger.error(f"Error listing resources: {e}")
                 return []
         
+        # ------------------------------------------------------------------
+        # Helper type returned by the handler – lightweight bridge that the
+        # upstream SDK converts into `TextResourceContents` / `BlobResourceContents`.
+        # ------------------------------------------------------------------
+
+        class ReadResourceContents(NamedTuple):
+            content: str | bytes
+            mime_type: str | None = None
+
         @self.app.read_resource()
-        async def read_resource(uri: AnyUrl) -> str:
-            """Read the content of a specific Obsidian note."""
+        async def read_resource(uri: AnyUrl) -> Iterable[ReadResourceContents]:
+            """Read the content of a specific Obsidian note.
+
+            Returns an iterable of `ReadResourceContents` so the SDK produces a
+            spec-compliant `ReadResourceResult` object.
+            """
             # Rate limiting
             if not await self.rate_limiter.is_allowed("read_resource"):
                 logger.warning("Rate limit exceeded for read_resource")
@@ -104,7 +198,9 @@ class ObsidianMCPServer:
                     raise ValueError(f"Note not found: {note_path}")
                 
                 logger.info(f"Read resource: {note_path}")
-                return content
+
+                # Wrap into iterable form expected by SDK wrapper
+                return [ReadResourceContents(content=content, mime_type="text/markdown")]
             except Exception as e:
                 logger.error(f"Error reading resource {uri}: {e}")
                 raise ValueError(f"Failed to read resource: {e}")
