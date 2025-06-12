@@ -63,6 +63,10 @@ async def test_create_initialization_options_basic():
 
     server = ObsidianMCPServer(settings)
 
+    # Re-apply strict version monkey-patch in case other tests reloaded the SDK
+    import obsidian_mcp_server.server as _srv_mod  # noqa: E402
+    _srv_mod._patch_strict_version_validation()
+
     # The real low-level Server instance is buried under the patched `.app` after
     # we reloaded the SDK above.  Assert the attribute exists before proceeding.
     assert hasattr(server.app, "create_initialization_options")

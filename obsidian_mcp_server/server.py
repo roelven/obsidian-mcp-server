@@ -86,7 +86,9 @@ def _patch_strict_version_validation() -> None:  # pragma: no cover – run at i
                             _types.ServerResult(
                                 _types.InitializeResult(
                                     protocolVersion=requested_version,
-                                    capabilities=self._init_options.capabilities,  # type: ignore[attr-defined]
+                                    capabilities=_types.ServerCapabilities.model_validate(
+                                        self._init_options.capabilities.model_dump(by_alias=True, mode="json", exclude_none=True)  # type: ignore[attr-defined]
+                                    ),
                                     serverInfo=_types.Implementation(
                                         name=self._init_options.server_name,  # type: ignore[attr-defined]
                                         version=self._init_options.server_version,  # type: ignore[attr-defined]
@@ -431,7 +433,8 @@ class ObsidianMCPServer:
                     return [types.TextContent(type="text", text=f"Error executing summarise_note: {e}")]
 
             else:
-                return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+                # Unknown tool – raise so the outer wrapper returns isError=True
+                raise ValueError(f"Unknown tool: {name}")
     
     def _create_note_uri(self, note_path: str) -> str:
         """Create MCP URI for a note."""
