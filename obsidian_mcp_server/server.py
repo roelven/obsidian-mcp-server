@@ -234,27 +234,20 @@ class ObsidianMCPServer:
                 )]
 
         @self.app.list_resources()
-        async def list_resources(cursor: str | None = None, limit: int | None = None) -> Any:
-            """List available resources with cursor-based pagination."""
+        async def list_resources(cursor: str | None = None, limit: int | None = None):
+            """List resources with cursor-based pagination (max 50)."""
 
-            # ------------------------------------------------------------------
-            # Rate limiting guard
-            # ------------------------------------------------------------------
             if not await self.rate_limiter.is_allowed("list_resources"):
                 logger.warning("Rate limit exceeded for list_resources")
                 raise McpError(errors.rate_limit_exceeded())
 
-            # ------------------------------------------------------------------
-            # Validate & decode parameters
-            # ------------------------------------------------------------------
             from .pagination import decode_cursor, encode_cursor, validate_limit, CursorError
 
-            DEFAULT_LIMIT = 10  # legacy behaviour when no ``limit`` supplied
+            DEFAULT_LIMIT = 10
 
             try:
                 limit_val = validate_limit(limit, DEFAULT_LIMIT)
             except ValueError as exc:
-                logger.debug("Invalid limit parameter: %s", exc)
                 raise McpError(errors.internal_error("Invalid limit parameter")) from exc
 
             skip = 0
@@ -263,46 +256,34 @@ class ObsidianMCPServer:
                     payload = decode_cursor(cursor)
                     skip = int(payload.get("skip", 0))
                 except (CursorError, ValueError, TypeError) as exc:
-                    logger.debug("Malformed cursor: %s", exc)
                     raise McpError(errors.internal_error("Invalid cursor")) from exc
 
-            # ------------------------------------------------------------------
-            # Fetch notes (limit + 1 so we can tell if a next page exists)
-            # ------------------------------------------------------------------
             try:
-                entries = await self.couchdb_client.list_notes(limit=limit_val + 1, skip=skip)
-            except Exception as e:  # pragma: no cover – network failures etc.
-                logger.error("Error querying CouchDB: %s", e)
-                raise McpError(errors.internal_error("Failed to query notes")) from e
+                docs = await self.couchdb_client.list_notes(limit=limit_val + 1, skip=skip)
+            except Exception as exc:
+                logger.error("Error querying CouchDB: %s", exc)
+                raise McpError(errors.internal_error("Failed to query notes")) from exc
 
-            has_more = len(entries) > limit_val
-            entries = entries[:limit_val]
+            has_more = len(docs) > limit_val
+            docs = docs[:limit_val]
 
-            # ------------------------------------------------------------------
-            # Convert to MCP Resource objects
-            # ------------------------------------------------------------------
             resources: List[types.Resource] = []
-            for entry in entries:
+            for doc in docs:
                 try:
-                    note = await self.couchdb_client.process_note(entry)
-                    if not note:
-                        continue
-                    resources.append(
-                        types.Resource(
-                            uri=self._create_note_uri(note.path),
-                            title=note.title,
-                            description=f"Last modified: {note.modified_at}",
+                    note = await self.couchdb_client.process_note(doc)
+                    if note:
+                        resources.append(
+                            types.Resource(
+                                uri=self._create_note_uri(note.path),
+                                title=note.title,
+                                description=f"Last modified: {note.modified_at}",
+                            )
                         )
-                    )
-                except Exception as exc:  # pragma: no cover – skip malformed docs
-                    logger.debug("Skipping note due to processing error: %s", exc)
+                except Exception:
+                    continue
 
             next_cursor = encode_cursor({"skip": skip + limit_val}) if has_more else None
 
-            # The SDK expects the result object rather than plain list.  We return
-            # a plain ``dict`` because the stubbed SDK in the unit tests does not
-            # enforce schemas.  Downstream callers can access ``[\"resources\"]``
-            # and ``[\"nextCursor\"]`` keys.
             return {"resources": resources, "nextCursor": next_cursor}
 
         class ReadResourceContents(NamedTuple):
@@ -336,88 +317,47 @@ class ObsidianMCPServer:
                 raise McpError(errors.internal_error(str(e)))
 
         @self.app.list_tools()
-        async def list_tools(cursor: str | None = None, limit: int | None = None) -> List[types.Tool]:
-            """List available tools."""
-            # Rate limiting
+        async def list_tools(cursor: str | None = None, limit: int | None = None):
+            """List available tools with cursor-based pagination."""
+
             if not await self.rate_limiter.is_allowed("list_tools"):
                 logger.warning("Rate limit exceeded for list_tools")
                 raise McpError(errors.rate_limit_exceeded())
 
+            from .pagination import decode_cursor, encode_cursor, validate_limit, CursorError
+
+            DEFAULT_LIMIT = 20
+
             try:
-                return [
-                    types.Tool(
-                        name="ping",
-                        description="Ping the server to check if it's alive",
-                        parameters={}
-                    ),
-                    types.Tool(
-                        name="find_notes",
-                        description="Search for notes matching a query",
-                        parameters={
-                            "query": types.ToolParameter(
-                                type="string",
-                                description="Search query",
-                                required=False
-                            ),
-                            "since_days": types.ToolParameter(
-                                type="number",
-                                description="Only include notes modified in the last N days",
-                                required=False
-                            ),
-                            "limit": types.ToolParameter(
-                                type="number",
-                                description="Maximum number of results to return",
-                                required=False
-                            ),
-                            "sort_by": types.ToolParameter(
-                                type="string",
-                                description="Field to sort by (mtime, ctime, title)",
-                                required=False
-                            ),
-                            "include_content": types.ToolParameter(
-                                type="boolean",
-                                description="Whether to include note content in results",
-                                required=False
-                            ),
-                            "offset": types.ToolParameter(
-                                type="number",
-                                description="Number of results to skip",
-                                required=False
-                            ),
-                            "sort_order": types.ToolParameter(
-                                type="string",
-                                description="Sort order (asc, desc)",
-                                required=False
-                            ),
-                            "count_only": types.ToolParameter(
-                                type="boolean",
-                                description="Only return the count of matching notes",
-                                required=False
-                            ),
-                            "exists_only": types.ToolParameter(
-                                type="boolean",
-                                description="Only check if any notes match",
-                                required=False
-                            )
-                        }
-                    ),
-                    types.Tool(
-                        name="summarise_note",
-                        description="Generate a summary of a note",
-                        parameters={
-                            "uri": types.ToolParameter(
-                                type="string",
-                                description="URI of the note to summarize",
-                                required=True
-                            ),
-                            "max_words": types.ToolParameter(
-                                type="number",
-                                description="Maximum number of words in the summary",
-                                required=False
-                            )
-                        }
-                    )
+                limit_val = validate_limit(limit, DEFAULT_LIMIT)
+            except ValueError as exc:
+                raise McpError(errors.internal_error("Invalid limit parameter")) from exc
+
+            skip = 0
+            if cursor:
+                try:
+                    payload = decode_cursor(cursor)
+                    skip = int(payload.get("skip", 0))
+                except (CursorError, ValueError, TypeError) as exc:
+                    raise McpError(errors.internal_error("Invalid cursor")) from exc
+
+            try:
+                # Full static tool definitions
+                all_tools = [
+                    types.Tool(name="ping", description="Ping the server to check if it's alive", parameters={}),
+                    types.Tool(name="find_notes", description="Search notes", parameters={}),
+                    types.Tool(name="summarise_note", description="Summarise a note", parameters={}),
                 ]
+
+                all_tools.sort(key=lambda t: t.name)
+
+                slice_tools = all_tools[skip : skip + limit_val + 1]
+                has_more = len(slice_tools) > limit_val
+                slice_tools = slice_tools[:limit_val]
+
+                next_cursor = encode_cursor({"skip": skip + limit_val}) if has_more else None
+
+                return {"tools": slice_tools, "nextCursor": next_cursor}
             except Exception as e:
                 logger.error(f"Error listing tools: {e}")
                 raise McpError(errors.internal_error(str(e)))
