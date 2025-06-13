@@ -234,7 +234,7 @@ class ObsidianMCPServer:
                 )]
 
         @self.app.list_resources()
-        async def list_resources() -> List[types.Resource]:
+        async def list_resources(cursor: str | None = None, limit: int | None = None) -> List[types.Resource]:
             """List available resources."""
             # Rate limiting
             if not await self.rate_limiter.is_allowed("list_resources"):
@@ -289,7 +289,7 @@ class ObsidianMCPServer:
                 raise McpError(errors.internal_error(str(e)))
 
         @self.app.list_tools()
-        async def list_tools() -> List[types.Tool]:
+        async def list_tools(cursor: str | None = None, limit: int | None = None) -> List[types.Tool]:
             """List available tools."""
             # Rate limiting
             if not await self.rate_limiter.is_allowed("list_tools"):
