@@ -374,11 +374,11 @@ class ObsidianMCPServer:
             except Exception as e:
                 logger.error(f"Error listing tools: {e}")
                 raise McpError(errors.internal_error(str(e)))
-
+    
     def _create_note_uri(self, note_path: str) -> str:
         """Create a URI for a note."""
         return f"obsidian://{quote(note_path)}"
-
+    
     def _extract_path_from_uri(self, uri: str) -> Optional[str]:
         """Extract a note path from a URI."""
         if not uri.startswith("obsidian://"):
@@ -387,7 +387,7 @@ class ObsidianMCPServer:
             return unquote(uri[11:])
         except Exception:
             return None
-
+    
     async def start_stdio(self):
         """Start the server in stdio mode."""
         await self.app.run()
@@ -435,7 +435,7 @@ class ObsidianMCPServer:
         """Start the server in HTTP mode."""
         import uvicorn
         uvicorn.run(self.build_http_app(), host="0.0.0.0", port=port)
-
+    
     def start_sse_sync(self, port: int):
         """Start the server in SSE mode."""
         import warnings
@@ -447,7 +447,7 @@ class ObsidianMCPServer:
         import uvicorn
         from .transport.sse import create_transport_app
         uvicorn.run(create_transport_app(self), host="0.0.0.0", port=port)
-
+    
     async def close(self):
         """Close the server."""
         await self.couchdb_client.close()
@@ -465,10 +465,10 @@ def main(port: int, transport: str) -> int:
     try:
         # Load settings
         settings = Settings()
-
+    
         # Create server
         server = ObsidianMCPServer(settings)
-
+    
         # Run server
         if transport == "stdio":
             asyncio.run(server.start_stdio())
