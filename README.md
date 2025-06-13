@@ -233,7 +233,14 @@ The server implements the MCP protocol version **2025-03-26**:
 
 #### `resources/list`
 
-Lists up to 10 recent Obsidian notes for performance optimization. For comprehensive note discovery, use the search and browse tools.
+Paginated listing of Obsidian notes.
+
+**Parameters (subset of standard MCP PaginatedRequest)**
+
+- `limit` (integer, 1-50, default 10) – max items to return in this page.
+- `cursor` (string, optional) – opaque token returned by the previous call.  Pass it to fetch the *next* page.
+
+If `cursor` is omitted the first page is returned. When the response contains `"nextCursor": null` there are no further pages.
 
 **Response:**
 ```json
@@ -245,7 +252,8 @@ Lists up to 10 recent Obsidian notes for performance optimization. For comprehen
       "description": "Path: path/to/note.md",
       "mimeType": "text/markdown"
     }
-  ]
+  ],
+  "nextCursor": "eyJza2lwIjozMH0"  // null when no more pages
 }
 ```
 

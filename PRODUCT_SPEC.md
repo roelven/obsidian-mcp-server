@@ -52,9 +52,10 @@ The Obsidian Model Context Protocol (MCP) Server aims to provide a bridge for AI
 ### 4. Architecture Design Decisions
 
 **4.1. Performance-Optimized Resource Listing**
-*   **Decision**: Limit `resources/list` to 10 recent notes instead of implementing pagination.
-*   **Rationale**: Prevents overwhelming AI clients with large lists while maintaining fast response times.
-*   **Alternative**: Comprehensive note discovery is provided through the single `find_notes` tool.
+*   **Decision**: Implement *cursor-based pagination* for `resources/list` (default `limit=10`, hard-cap 50).
+*   **Rationale**: Still returns small pages by default but allows clients to page through the vault when needed without a bespoke search.
+*   **Implementation**: Adds `limit` and `cursor` params; response gains `nextCursor`.  When `nextCursor` is `null` there are no further pages.
+*   **Alternative**: Clients can skip `resources/list` altogether and rely on the more powerful `find_notes` tool.
 
 **4.2. Tools-Based Search Implementation**
 *   **Decision**: Implement note operations via **two** MCP tools (`find_notes`, `summarise_note`) instead of several overlapping ones.
@@ -220,23 +221,12 @@ On rejection the client **SHOULD** retry with a supported version (typically the
 **2.4. Resource Methods (JSON-RPC)**
 
 **2.4.1. \`resources/list\` (Client to Server)**
-*   **Description:** Lists a limited set of available resources (Obsidian notes) for performance.
-*   **Performance Design:** Returns maximum 10 recent notes to prevent overwhelming AI clients. For comprehensive note discovery, clients should call the \`find_notes\` tool.
-*   **\`params\`:** Standard MCP parameters (cursor, filter, rootUri - currently not implemented)
-*   **\`result\` (Server Response):** \`ListResourcesResult\`
-    \`\`\`json
-    {
-      "resources": [
-        {
-          "uri": "mcp-obsidian://vault-id/notes/project-alpha/index.md",
-          "name": "index.md",
-          "description": "Path: notes/project-alpha/index.md",
-          "mimeType": "text/markdown"
-        }
-        // ... up to 10 Resource objects
-      ]
-    }
-    \`\`\`
+*   **Description:** Paginated list of Obsidian notes.
+*   **Performance Design:** Default `limit` is 10 to maintain fast responses; caller may request up to 50.
+*   **`params`:**
+    * `limit` (int, 1-50, optional) – items per page (default 10)
+    * `cursor` (string, optional) – opaque paging token
+*   **`result`:** `ListResourcesResult` with `nextCursor` set to `null` when no further pages.
 
 **2.4.2. \`resources/read\` (Client to Server)**
 *   **Description:** Retrieves the content of a specific resource (Obsidian note).
