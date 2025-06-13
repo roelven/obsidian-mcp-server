@@ -140,7 +140,7 @@ def _create_mcp_stub() -> None:  # pragma: no cover – helper
             attrs = ", ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
             return f"<{self.__class__.__name__} {attrs}>"
 
-    for _cls_name in ("Resource", "Tool", "TextContent"):
+    for _cls_name in ("Resource", "Tool"):
         setattr(mcp.types, _cls_name, _Plain)
 
     # ------------------------------------------------------------------

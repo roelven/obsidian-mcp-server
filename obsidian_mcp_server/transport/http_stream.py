@@ -32,6 +32,19 @@ from obsidian_mcp_server.rate_limiter import RateLimiter
 import asyncio
 from starlette.background import BackgroundTask
 import os
+try:
+    from mcp.server.models import InitializationOptions
+except ImportError:
+    from pydantic import BaseModel
+    from mcp.types import ServerCapabilities
+    class InitializationOptions(BaseModel):
+        server_name: str
+        server_version: str
+        capabilities: ServerCapabilities
+        instructions: str | None = None
+from mcp.server.lowlevel.server import Server
+from obsidian_mcp_server.config import Settings
+from obsidian_mcp_server.server import ObsidianMCPServer
 
 __all__ = ["create_transport_app", "SessionStreams"]
 
@@ -251,125 +264,97 @@ _session_mgr = SessionManager()
 # HTTP handlers
 # ---------------------------------------------------------------------------
 
-async def _handle_post(request: Request) -> Response:
-    """Handle POST requests to /messages/."""
-    logger.debug("Handling POST request")
-    try:
-        # Get message from request
-        message = await request.json()
-        logger.debug(f"Got message: {message}")
+# Session state for each HTTP client
+class HttpSession:
+    def __init__(self, server: Server, initialization_options: InitializationOptions):
+        self.input_stream = anyio.create_memory_object_stream(100)
+        self.output_stream = anyio.create_memory_object_stream(100)
+        self.server_task = None
+        self.server = server
+        self.initialization_options = initialization_options
+        self.closed = False
 
-        # Create session
-        session_id = _session_mgr.create_session()
-        logger.debug(f"Created session: {session_id}")
-
-        # Put message in server queue
-        logger.debug("Putting message in server queue")
-        await _session_mgr.get_session(session_id)["server_queue"].put(message)
-
-        # Start message processor
-        logger.debug("Starting message processor")
-        await _session_mgr.start_message_processor(session_id)
-
-        # Return session ID
-        logger.debug("Returning session ID")
-        return Response(
-            status_code=202,
-            headers={"Mcp-Session-Id": session_id}
+    async def start(self):
+        # Start the MCP server for this session
+        self.server_task = asyncio.create_task(
+            self.server.run(
+                self.input_stream[0],
+                self.output_stream[1],
+                self.initialization_options,
+            )
         )
+
+    async def close(self):
+        self.closed = True
+        if self.server_task:
+            self.server_task.cancel()
+            try:
+                await self.server_task
+            except Exception:
+                pass
+        await self.input_stream[0].aclose()
+        await self.output_stream[1].aclose()
+
+# Global session registry
+_sessions = {}
+
+# Helper to create InitializationOptions with patched capabilities
+def build_initialization_options(server: ObsidianMCPServer):
+    # Use the patched create_initialization_options
+    return server.app.create_initialization_options()
+
+# HTTP POST handler
+async def _handle_post(request: Request) -> Response:
+    try:
+        message = await request.json()
+        # Get or create session
+        session_id = request.headers.get("Mcp-Session-Id")
+        if not session_id or session_id not in _sessions:
+            # New session
+            session_id = str(uuid.uuid4())
+            # Build the ObsidianMCPServer and get the MCP Server instance
+            settings = Settings()
+            obsidian_server = ObsidianMCPServer(settings)
+            mcp_server = obsidian_server.app
+            init_opts = build_initialization_options(obsidian_server)
+            session = HttpSession(mcp_server, init_opts)
+            await session.start()
+            _sessions[session_id] = session
+        else:
+            session = _sessions[session_id]
+        # Write message to input stream
+        await session.input_stream[1].send(message)
+        # Read response from output stream
+        response = await session.output_stream[0].receive()
+        return JSONResponse(response, headers={"Mcp-Session-Id": session_id})
     except Exception as e:
         logger.error(f"Error handling POST request: {e}")
-        return Response(
-            status_code=500,
-            content=json.dumps({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32603,
-                    "message": f"Internal error: {str(e)}"
-                }
-            }),
-            media_type="application/json"
-        )
-
-async def _handle_get(request: Request) -> Response:
-    """Handle GET requests to /messages/."""
-    logger.debug("Received GET request")
-    try:
-        # Get session ID
-        session_id = request.headers.get("Mcp-Session-Id")
-        if not session_id:
-            logger.error("No session ID in headers")
-            return JSONResponse(
-                {"error": "Mcp-Session-Id header required"},
-                status_code=400
-            )
-
-        # Get session
-        session = _session_mgr.get_session(session_id)
-        if not session:
-            logger.error(f"Session {session_id} not found")
-            return JSONResponse(
-                {"error": "Session not found"},
-                status_code=404
-            )
-
-        # Return SSE stream
-        logger.debug(f"Starting SSE stream for session {session_id}")
-        return StreamingResponse(
-            _event_generator(session),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Content-Type": "text/event-stream",
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error handling GET request: {e}")
-        return JSONResponse(
-            {"error": str(e)},
-            status_code=500
-        )
-
-async def _event_generator(session: Dict[str, Any]):
-    """Generate SSE events from the client queue."""
-    logger.debug("Starting event generator")
-    try:
-        while True:
-            # Get message from client queue with timeout
-            logger.debug("Waiting for message from client queue")
-            try:
-                message = await asyncio.wait_for(session["client_queue"].get(), timeout=2.0)
-                logger.debug(f"Got message from client queue: {message}")
-
-                # Send as SSE event
-                logger.debug("Sending SSE event")
-                yield f"data: {json.dumps(message)}\n\n".encode("utf-8")
-                logger.debug("SSE event sent")
-
-                # If this was a ping response, we're done
-                if message.get("jsonrpc") == "2.0" and message.get("result") == "pong":
-                    logger.debug("Received ping response, closing event generator")
-                    break
-            except asyncio.TimeoutError:
-                logger.debug("Timeout waiting for message from client queue")
-                # Send a keep-alive comment
-                yield b": keep-alive\n\n"
-                continue
-    except Exception as e:
-        logger.error(f"Error in event generator: {e}")
-        # Send error as SSE event
-        error_message = {
+        return JSONResponse({
             "jsonrpc": "2.0",
             "error": {
                 "code": -32603,
                 "message": f"Internal error: {str(e)}"
             }
-        }
-        yield f"data: {json.dumps(error_message)}\n\n".encode("utf-8")
-        raise
-    finally:
-        logger.debug("Event generator finished")
+        }, status_code=500)
+
+# HTTP GET handler for SSE
+async def _handle_get(request: Request) -> Response:
+    session_id = request.headers.get("Mcp-Session-Id")
+    if not session_id or session_id not in _sessions:
+        return JSONResponse({"error": "Mcp-Session-Id header required or session not found"}, status_code=400)
+    session = _sessions[session_id]
+    async def event_stream():
+        try:
+            while not session.closed:
+                try:
+                    message = await asyncio.wait_for(session.output_stream[0].receive(), timeout=2.0)
+                    yield f"data: {json.dumps(message)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+        except Exception as e:
+            logger.error(f"Error in SSE event stream: {e}")
+            yield f"data: {json.dumps({'jsonrpc': '2.0', 'error': {'code': -32603, 'message': str(e)}})}\n\n"
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 # ---------------------------------------------------------------------------
 # Public factory
@@ -380,7 +365,7 @@ def create_transport_app() -> Starlette:
     logger.debug("Creating transport app")
     return Starlette(routes=[
         Route("/messages/", _handle_post, methods=["POST"]),
-        Route("/messages/", _handle_get, methods=["GET"])
+        Route("/messages/", _handle_get, methods=["GET"]),
     ])
 
 def set_message_processor(processor: Callable[[str, dict], Awaitable[dict]]) -> None:

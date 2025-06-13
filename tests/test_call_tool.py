@@ -51,6 +51,7 @@ async def test_call_tool_find_notes(monkeypatch):
     )
 
     result: types.ServerResult = await handler(request)
+    print(f"Result type: {type(result.root)}, value: {result.root.model_dump()}")
     assert isinstance(result.root, types.CallToolResult)
     assert result.root.isError is False
 
@@ -75,5 +76,6 @@ async def test_call_tool_unknown(monkeypatch):
     )
 
     result: types.ServerResult = await handler(request)
+    print(f"Result type: {type(result.root)}, value: {result.root.model_dump()}")
     assert isinstance(result.root, types.CallToolResult)
     assert result.root.isError is True 

@@ -24,4 +24,4 @@ USER app
 EXPOSE 8000
 
 # Default command (can be overridden)
-CMD ["obsidian-mcp-server", "--transport", "sse", "--port", "8000"] 
+CMD ["obsidian-mcp-server", "--transport", "http", "--port", "8000"] 
