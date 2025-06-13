@@ -181,6 +181,28 @@ def _create_mcp_stub() -> None:  # pragma: no cover – helper
         async def run(self, *_args, **_kwargs):  # noqa: D401, D401 – unused
             raise RuntimeError("Not implemented in stub – shouldn't be called in unit tests")
 
+        # Provide compatibility alias used by tests that expect the real SDK API
+        # (which stores handlers in `.request_handlers`).
+        @property  # type: ignore[override]
+        def request_handlers(self):  # noqa: D401 – simple alias
+            # Wrap string keys into lightweight proxy objects so that tests
+            # expecting a ``.__name__`` attribute on the key (matching the
+            # request class name in the real SDK) continue to work.
+            _name_map = {
+                "resources/list": "ListResourcesRequest",
+                "resources/read": "ReadResourceRequest",
+                "tools/list": "ListToolsRequest",
+                "tools/call": "CallToolRequest",
+                "ping": "PingRequest",
+            }
+
+            class _KeyProxy(str):
+                @property  # type: ignore[override]
+                def __name__(self):  # noqa: D401 – emulate class attribute
+                    return _name_map.get(self, str(self))
+
+            return {_KeyProxy(k): v for k, v in self._method_handlers.items()}
+
     mcp.server.lowlevel.Server = _FakeServer  # type: ignore[attr-defined]
 
 
